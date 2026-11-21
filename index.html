@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MARS JARVIS</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="bg-grid"></div>
+<div class="bg-glow"></div>
+<div class="scanline"></div>
+
+<div class="app">
+
+  <!-- ============ SIDEBAR ============ -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-core"></div>
+      <div class="brand-text"><b>MARS</b><span>JARVIS · PHASE 1</span></div>
+    </div>
+    <nav class="nav">
+      <button class="nav-btn active" data-view="home"><i>⌂</i><span>Home</span></button>
+      <button class="nav-btn" data-view="memory"><i>◫</i><span>Memory</span></button>
+      <button class="nav-btn" data-view="tasks"><i>☑</i><span>Tasks</span></button>
+      <button class="nav-btn" data-view="console"><i>◉</i><span>Voice</span></button>
+      <button class="nav-btn" data-view="settings"><i>⚙</i><span>Settings</span></button>
+    </nav>
+    <div class="side-foot">
+      <div class="sync-dot" id="syncDot"></div>
+      <span id="syncText">Offline</span>
+    </div>
+  </aside>
+
+  <!-- ============ MAIN ============ -->
+  <main class="main">
+    <header class="topbar">
+      <h1 id="viewTitle">Home</h1>
+      <div class="top-right">
+        <span id="clock" class="clock"></span>
+        <button class="chip" id="topAuth">Connect Drive</button>
+      </div>
+    </header>
+
+    <!-- ---------- HOME ---------- -->
+    <section class="view active" id="view-home">
+      <div class="home-grid">
+        <div class="glass hero">
+          <div class="reactor">
+            <svg viewBox="0 0 200 200" aria-hidden="true">
+              <g class="ring r1"><circle cx="100" cy="100" r="94" stroke-dasharray="3 9"/></g>
+              <g class="ring r2"><circle cx="100" cy="100" r="80" stroke-dasharray="70 16 12 16"/></g>
+              <g class="ring r3"><circle cx="100" cy="100" r="64" stroke-dasharray="22 10"/></g>
+              <circle class="mid" cx="100" cy="100" r="46"/>
+              <polygon class="tri" points="100,66 130,118 70,118"/>
+              <circle class="core" cx="100" cy="100" r="16"/>
+            </svg>
+          </div>
+          <div class="hero-text">
+            <p class="eyebrow" id="homeDate"></p>
+            <h2 id="homeGreeting">Good evening.</h2>
+            <p class="muted">All systems nominal. Say <b>"Jarvis"</b> followed by a command, or type one below.</p>
+            <form id="homeForm" class="cmd-form">
+              <input id="homeInput" placeholder='Try: "add note blockchain idea"' autocomplete="off">
+              <button class="btn primary">Run</button>
+            </form>
+          </div>
+        </div>
+
+        <div class="stats">
+          <div class="glass stat"><span class="stat-n" id="statNotes">0</span><span class="stat-l">Notes</span></div>
+          <div class="glass stat"><span class="stat-n" id="statTasks">0</span><span class="stat-l">Open tasks</span></div>
+          <div class="glass stat"><span class="stat-n" id="statCmds">0</span><span class="stat-l">Commands</span></div>
+          <div class="glass stat"><span class="stat-n small" id="statSync">Offline</span><span class="stat-l">Drive sync</span></div>
+        </div>
+
+        <div class="glass panel">
+          <h3>Recent activity</h3>
+          <ul id="recentList" class="list"></ul>
+        </div>
+
+        <div class="glass panel">
+          <h3>Command cheat sheet</h3>
+          <ul class="list cheats">
+            <li><code>Jarvis, add note blockchain idea</code></li>
+            <li><code>Jarvis, show notes</code> · <code>search notes for blockchain</code></li>
+            <li><code>Jarvis, delete note 2</code> · <code>edit note 1 to …</code></li>
+            <li><code>Jarvis, add high priority task call mom</code></li>
+            <li><code>Jarvis, complete task 1</code> · <code>delete task 2</code></li>
+            <li><code>Jarvis, set task 3 to low priority</code></li>
+            <li><code>Jarvis, go to tasks</code> · <code>what time is it</code> · <code>help</code></li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------- MEMORY ---------- -->
+    <section class="view" id="view-memory">
+      <div class="two-col">
+        <div class="glass panel">
+          <h3>New note</h3>
+          <form id="noteForm" class="stack">
+            <input id="noteTitle" placeholder="Title" autocomplete="off" required>
+            <textarea id="noteBody" rows="5" placeholder="Write something worth remembering…"></textarea>
+            <button class="btn primary">Save note</button>
+          </form>
+        </div>
+        <div class="glass panel wide">
+          <div class="row-between">
+            <h3>Notes <small id="noteCount"></small></h3>
+            <input id="noteSearch" class="search" placeholder="Search notes…" autocomplete="off">
+          </div>
+          <div id="notesList" class="cards"></div>
+        </div>
+      </div>
+
+      <div class="glass panel">
+        <div class="row-between">
+          <h3>Memory file · <code>jarvis_data.json</code></h3>
+          <div class="btn-row">
+            <button class="btn" id="btnReload">Reload from Drive</button>
+            <button class="btn" id="btnSaveNow">Save now</button>
+          </div>
+        </div>
+        <p class="muted small-t" id="memoryMeta"></p>
+        <details>
+          <summary>Inspect raw data</summary>
+          <pre id="dataInspector" class="inspector"></pre>
+        </details>
+      </div>
+    </section>
+
+    <!-- ---------- TASKS ---------- -->
+    <section class="view" id="view-tasks">
+      <div class="glass panel">
+        <form id="taskForm" class="task-form">
+          <input id="taskText" placeholder="Add a task…" autocomplete="off" required>
+          <select id="taskPriority">
+            <option value="high">High</option>
+            <option value="medium" selected>Medium</option>
+            <option value="low">Low</option>
+          </select>
+          <button class="btn primary">Add task</button>
+        </form>
+      </div>
+      <div class="glass panel">
+        <div class="row-between"><h3>Task list <small id="taskCount"></small></h3></div>
+        <ul id="tasksList" class="tasks"></ul>
+      </div>
+    </section>
+
+    <!-- ---------- VOICE CONSOLE ---------- -->
+    <section class="view" id="view-console">
+      <div class="two-col">
+        <div class="glass panel voice-panel">
+          <div class="orb off" id="orb"><div class="orb-ring"></div><div class="orb-ring r2"></div><div class="orb-core"></div></div>
+          <div class="orb-label" id="orbLabel">Voice offline</div>
+          <div class="live" id="liveText">&nbsp;</div>
+          <div class="btn-row center">
+            <button class="btn primary" id="btnListen">● Start listening</button>
+            <button class="btn" id="btnPtt">Hold to talk</button>
+            <button class="btn" id="btnMute">🔊 Voice on</button>
+          </div>
+          <p class="muted small-t" id="voiceSupport"></p>
+          <form id="cmdForm" class="cmd-form">
+            <input id="cmdInput" placeholder="Type a command (no need to say Jarvis)…" autocomplete="off">
+            <button class="btn">Send</button>
+          </form>
+        </div>
+        <div class="glass panel wide">
+          <div class="row-between">
+            <h3>Command history</h3>
+            <button class="btn small" id="btnClearHistory">Clear</button>
+          </div>
+          <ul id="historyList" class="history"></ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------- SETTINGS ---------- -->
+    <section class="view" id="view-settings">
+      <div class="two-col">
+        <div class="glass panel">
+          <h3>Google Drive</h3>
+          <p class="muted small-t">Create an OAuth <b>Web application</b> client in Google Cloud Console, enable the <b>Google Drive API</b>, and add this page's origin below under <i>Authorized JavaScript origins</i>.</p>
+          <div class="origin">Origin: <code id="originText"></code></div>
+          <label>OAuth Client ID</label>
+          <input id="clientId" placeholder="1234567890-abc….apps.googleusercontent.com" autocomplete="off" spellcheck="false">
+          <div class="btn-row">
+            <button class="btn" id="btnSaveClient">Save Client ID</button>
+            <button class="btn primary" id="btnConnect">Connect Google Drive</button>
+            <button class="btn danger" id="btnDisconnect">Disconnect</button>
+          </div>
+          <p class="muted small-t" id="authInfo">Not connected.</p>
+          <p class="muted small-t">Scope used: <code>drive.file</code>. Mars Jarvis can only see the file it created, nothing else in your Drive.</p>
+        </div>
+
+        <div class="glass panel">
+          <h3>Voice</h3>
+          <label>Wake word</label>
+          <input id="wakeWord" autocomplete="off" spellcheck="false">
+          <label>Voice</label>
+          <select id="voiceSelect"></select>
+          <label>Speech rate <span id="rateVal"></span></label>
+          <input type="range" id="rate" min="0.6" max="1.6" step="0.05">
+          <label>Pitch <span id="pitchVal"></span></label>
+          <input type="range" id="pitch" min="0.6" max="1.6" step="0.05">
+          <label class="check"><input type="checkbox" id="autoListen"> Start listening automatically when the page opens</label>
+          <div class="btn-row">
+            <button class="btn" id="btnTestVoice">Test voice</button>
+            <button class="btn" id="btnExport">Export data (.json)</button>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div class="toast-wrap" id="toasts"></div>
+
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<script src="app.js"></script>
+</body>
+</html>
