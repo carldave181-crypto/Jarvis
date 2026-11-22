@@ -1,5 +1,5 @@
 /* =========================================================
-   MARS JARVIS · Phase 1 foundation
+   MARS JARVIS · Phase 2 (more commands)
    Vanilla JS · Google Identity Services · Drive API · Web Speech API
    No backend, no database, no framework.
    All persistent memory lives in Google Drive: jarvis_data.json
@@ -36,10 +36,10 @@ function h(tag, attrs = {}, ...kids) {
   return el;
 }
 
-function toast(msg, type = '') {
+function toast(msg, type = '', ms = 4200) {
   const t = h('div', { class: 'toast ' + type }, msg);
   $('#toasts').append(t);
-  setTimeout(() => t.remove(), 4200);
+  setTimeout(() => t.remove(), ms);
 }
 
 /* ================= STATE ================= */
@@ -47,12 +47,13 @@ const blankData = () => ({
   notes: [],
   tasks: [],
   research: [],
-  settings: { wakeWord: 'jarvis', voiceName: '', rate: 1, pitch: 1, autoListen: false, muted: false },
+  reminders: [],
+  settings: { wakeWord: 'jarvis', voiceName: '', rate: 1, pitch: 1, autoListen: false, muted: false, home: null },
   conversations: []
 });
 let data = blankData();
 const sync = { status: 'offline', fileId: null, user: null, saving: false, again: false, timer: null, lastSaved: null };
-const ui = { view: 'home', editingNote: null, noteFilter: '' };
+const ui = { view: 'home', editingNote: null, noteFilter: '', undo: null, warned: false, lastJoke: '' };
 
 function normalize(d) {
   const b = blankData();
@@ -61,6 +62,7 @@ function normalize(d) {
     notes: Array.isArray(d.notes) ? d.notes : [],
     tasks: Array.isArray(d.tasks) ? d.tasks : [],
     research: Array.isArray(d.research) ? d.research : [],
+    reminders: Array.isArray(d.reminders) ? d.reminders : [],
     conversations: Array.isArray(d.conversations) ? d.conversations : [],
     settings: { ...b.settings, ...(d.settings || {}) }
   };
@@ -200,7 +202,7 @@ async function loadMemory() {
   } else {
     const remote = normalize(await driveApi.read(sync.fileId));
     let added = 0;
-    for (const col of ['notes', 'tasks', 'research', 'conversations']) {
+    for (const col of ['notes', 'tasks', 'research', 'reminders', 'conversations']) {
       const have = new Set(remote[col].map(x => x.id));
       for (const it of local[col]) if (!have.has(it.id)) { remote[col].push(it); added++; }
     }
@@ -213,7 +215,7 @@ async function loadMemory() {
   renderAll();
 }
 
-/* addMemory / editMemory / deleteMemory work on any collection: notes, tasks, research, conversations */
+/* addMemory / editMemory / deleteMemory work on any collection: notes, tasks, research, reminders, conversations */
 function addMemory(col, item) { data[col].push(item); touch(); return item; }
 function editMemory(col, id, patch) {
   const it = data[col].find(x => x.id === id);
@@ -359,28 +361,34 @@ function updateVoiceUI() {
 }
 setInterval(() => { if (voice.awakeUntil && Date.now() > voice.awakeUntil) { voice.awakeUntil = 0; updateVoiceUI(); } }, 800);
 
-/* ================= COMMAND ENGINE ================= */
+/* ================= COMMAND ENGINE (Phase 2) ================= */
 const NUM_WORDS = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10, first: 1, second: 2, third: 3, fourth: 4, fifth: 5 };
 const PRIO_ORDER = { high: 0, medium: 1, low: 2 };
+const DAYS = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
 
 const sortedNotes = () => [...data.notes].sort((a, b) => (b.created || '').localeCompare(a.created || ''));
 const sortedTasks = () => [...data.tasks].sort((a, b) =>
   (a.done - b.done) || (PRIO_ORDER[a.priority] - PRIO_ORDER[b.priority]) || (a.created || '').localeCompare(b.created || ''));
+const activeReminders = () => data.reminders.filter(r => !r.fired).sort((a, b) => a.due.localeCompare(b.due));
 
 /* resolve "2", "two", "last", or a text fragment to an item in a displayed list */
 function resolveTarget(list, ref, textOf) {
-  ref = ref.trim().toLowerCase().replace(/^(number|no\.?|#)\s*/, '').replace(/^(the|my)\s+/, '');
+  ref = ref.trim().toLowerCase().replace(/^(?:the|my)\s+/, '').replace(/^(?:task|note|reminder|timer)\s+/, '').replace(/^(number|no\.?|#)\s*/, '').replace(/^the\s+/, '');
   if (!list.length) return null;
   if (/^(last|latest|newest|recent)(\s+one)?$/.test(ref))
     return list.reduce((a, b) => ((b.created || '') > (a.created || '') ? b : a));
+  if (/^(oldest)(\s+one)?$/.test(ref)) return list.reduce((a, b) => ((b.created || '') < (a.created || '') ? b : a));
   const n = /^\d+$/.test(ref) ? parseInt(ref, 10) : NUM_WORDS[ref];
   if (n) return list[n - 1] || null;
   const words = ref.split(/\s+/).filter(Boolean);
+  if (!words.length) return null;
   return list.find(it => textOf(it).toLowerCase().includes(ref)) ||
          list.find(it => words.every(w => textOf(it).toLowerCase().includes(w))) || null;
 }
 const noteText = n => (n.title || '') + ' ' + (n.body || '');
 const taskText = t => t.text || '';
+const remText = r => r.text || '';
 
 function parsePriority(s) {
   let prio = null;
@@ -399,14 +407,167 @@ function go(view) {
 }
 
 const syncNote = () => signedIn() ? '' : ' Drive is not connected yet, so it only lives in this session.';
+const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
 
-/* ---- notes ---- */
+/* ---------- date & time parsing ---------- */
+const MONTH_SRC = '(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)';
+const DAY_SRC = '(?:day after tomorrow|tomorrow|today|tonight|(?:(?:on|this|next|coming)\\s+)?(?:' + DAYS.join('|') + ')|next week|in\\s+\\d+\\s+(?:days?|weeks?)|' +
+  MONTH_SRC + '\\.?\\s+\\d{1,2}(?:st|nd|rd|th)?|\\d{1,2}(?:st|nd|rd|th)?\\s+(?:of\\s+)?' + MONTH_SRC + ')';
+const DAY_RE = new RegExp('\\b' + DAY_SRC + '\\b', 'i');
+const UNIT = '(?:seconds?|secs?|minutes?|mins?|hours?|hrs?|days?|weeks?)';
+const ONES = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10, eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15, sixteen: 16, seventeen: 17, eighteen: 18, nineteen: 19 };
+const TENS = { twenty: 20, thirty: 30, forty: 40, fifty: 50, sixty: 60, seventy: 70, eighty: 80, ninety: 90 };
+
+const dateStr = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+const midnight = (d = new Date()) => new Date(d.getFullYear(), d.getMonth(), d.getDate());
+const addDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); return x; };
+
+function dayFromStr(s) {
+  s = s.toLowerCase().trim();
+  const today = midnight();
+  let m;
+  if (s === 'day after tomorrow') return addDays(today, 2);
+  if (s === 'tomorrow') return addDays(today, 1);
+  if (s === 'today' || s === 'tonight') return today;
+  if (s === 'next week') return addDays(today, 7);
+  if ((m = s.match(/^in\s+(\d+)\s+(day|week)s?$/))) return addDays(today, parseInt(m[1], 10) * (m[2] === 'week' ? 7 : 1));
+  for (let i = 0; i < 7; i++) if (s.includes(DAYS[i])) {
+    let diff = (i - today.getDay() + 7) % 7; if (diff === 0) diff = 7;
+    return addDays(today, diff);
+  }
+  const mi = (str) => MONTHS.findIndex(x => str.toLowerCase().startsWith(x));
+  let mon = -1, day = 0;
+  if ((m = s.match(new RegExp('^(' + MONTH_SRC + ')\\.?\\s+(\\d{1,2})')))) { mon = mi(m[1]); day = +m[2]; }
+  else if ((m = s.match(new RegExp('^(\\d{1,2})(?:st|nd|rd|th)?\\s+(?:of\\s+)?(' + MONTH_SRC + ')')))) { mon = mi(m[2]); day = +m[1]; }
+  if (mon >= 0) {
+    let d = new Date(today.getFullYear(), mon, day);
+    if (d < today) d = new Date(today.getFullYear() + 1, mon, day);
+    return d;
+  }
+  return null;
+}
+
+function normDur(s) {
+  s = s.toLowerCase();
+  s = s.replace(/\ba quarter of an hour\b/g, '15 minutes').replace(/\bhalf an hour\b/g, '30 minutes')
+       .replace(/\ban hour and a half\b/g, '90 minutes').replace(/\bhalf a minute\b/g, '30 seconds')
+       .replace(/\ba couple of (\w+)/g, '2 $1');
+  s = s.replace(new RegExp('\\b(twenty|thirty|forty|fifty|sixty)[\\s-](one|two|three|four|five|six|seven|eight|nine)(?=\\s*' + UNIT + ')', 'g'), (_, a, b) => String(TENS[a] + ONES[b]));
+  s = s.replace(new RegExp('\\b(' + Object.keys(ONES).concat(Object.keys(TENS)).join('|') + ')(?=\\s*' + UNIT + '\\b)', 'g'), (_, w) => String(ONES[w] || TENS[w]));
+  s = s.replace(new RegExp('\\ban?(?=\\s+' + UNIT + '\\b)', 'g'), '1');
+  s = s.replace(new RegExp('(\\d+)\\s+and a half\\s+(' + UNIT + ')', 'g'), (_, n, u) => (parseInt(n, 10) + 0.5) + ' ' + u);
+  return s;
+}
+function parseDur(s) {
+  s = normDur(s);
+  const re = new RegExp('(\\d+(?:\\.\\d+)?)\\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?|days?|weeks?)\\b', 'g');
+  let ms = 0, m, any = false;
+  while ((m = re.exec(s))) {
+    any = true;
+    const n = parseFloat(m[1]), u = m[2][0], w = m[2].slice(0, 2);
+    ms += n * (u === 's' ? 1000 : (u === 'm' && w !== 'mo') ? 60000 : u === 'h' ? 3600000 : u === 'd' ? 86400000 : 604800000);
+  }
+  return any ? Math.round(ms) : null;
+}
+function fmtDur(ms) {
+  let s = Math.round(ms / 1000);
+  const parts = [];
+  const d = Math.floor(s / 86400); s -= d * 86400;
+  const hh = Math.floor(s / 3600); s -= hh * 3600;
+  const mm = Math.floor(s / 60); s -= mm * 60;
+  if (d) parts.push(plural(d, 'day')); if (hh) parts.push(plural(hh, 'hour')); if (mm) parts.push(plural(mm, 'minute')); if (s) parts.push(plural(s, 'second'));
+  return parts.join(' ') || '0 seconds';
+}
+const fmtClock = d => d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+function fmtWhen(d) {
+  const diff = Math.round((midnight(d) - midnight()) / 86400000);
+  const day = diff === 0 ? 'at ' : diff === 1 ? 'tomorrow at ' : d.toLocaleDateString([], { weekday: 'long', month: 'short', day: 'numeric' }) + ' at ';
+  return day + fmtClock(d);
+}
+function fmtDue(ds) {
+  const d = new Date(ds + 'T00:00:00');
+  const diff = Math.round((d - midnight()) / 86400000);
+  if (diff === 0) return 'today'; if (diff === 1) return 'tomorrow'; if (diff === -1) return 'yesterday';
+  return d.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
+}
+
+function matchClock(t) {
+  let m;
+  if ((m = t.match(/\b(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*([ap])\.?m\.?(?=\W|$)/i)))
+    return { h: +m[1], m: +(m[2] || 0), mer: m[3].toLowerCase() === 'p' ? 'pm' : 'am', str: m[0] };
+  if ((m = t.match(/\b(?:at\s+)?(noon|midnight)\b/i)))
+    return { h: m[1].toLowerCase() === 'noon' ? 12 : 0, m: 0, mer: 'x', str: m[0] };
+  if ((m = t.match(/\b(?:at\s+)?(\d{1,2})\s*o'?clock\b/i))) return { h: +m[1], m: 0, mer: null, str: m[0] };
+  if ((m = t.match(/\bat\s+(\d{1,2})(?::(\d{2}))?(?!\d)(?!\s*(?:minutes?|mins?|hours?|seconds?))/i))) return { h: +m[1], m: +(m[2] || 0), mer: null, str: m[0] };
+  if ((m = t.match(/\b(\d{1,2}):(\d{2})\b/))) return { h: +m[1], m: +m[2], mer: null, str: m[0] };
+  return null;
+}
+
+const tidyEdge = s => {
+  s = s.replace(/\s{2,}/g, ' ').trim();
+  let prev;
+  do { prev = s; s = s.replace(/^(?:[,.]|\b(?:and|to|that|about|for|at|on|in|of)\b)\s*/i, '').replace(/\s*(?:[,.]|\b(?:at|on|in|by|and|for)\b)$/i, '').trim(); } while (s !== prev);
+  return s;
+};
+
+/* find a time in free text ("in 10 minutes", "at 5pm", "tomorrow at 9", "friday evening"); returns {due, text} or null */
+function findWhen(text) {
+  const now = new Date();
+  let t = normDur(text);
+  const dm = t.match(new RegExp('\\b(?:in|after)\\s+(\\d+(?:\\.\\d+)?\\s*' + UNIT + '\\b(?:\\s*(?:,|and)?\\s*\\d+(?:\\.\\d+)?\\s*' + UNIT + '\\b)*)', 'i'));
+  if (dm) {
+    const ms = parseDur(dm[1]);
+    if (ms) return { due: new Date(now.getTime() + ms), text: tidyEdge(t.replace(dm[0], ' ')) };
+  }
+  let day = null, dayWord = '';
+  const dmatch = t.match(DAY_RE);
+  if (dmatch) { day = dayFromStr(dmatch[0]); dayWord = dmatch[0].toLowerCase(); t = t.replace(dmatch[0], ' '); }
+  const clock = matchClock(t);
+  if (clock) t = t.replace(clock.str, ' ');
+  let partHour = null;
+  if (!clock) {
+    const pm = t.match(/\b(?:in the |this |at )?(morning|afternoon|evening|night)\b/i);
+    if (pm) { partHour = { morning: 9, afternoon: 15, evening: 18, night: 20 }[pm[1].toLowerCase()]; t = t.replace(pm[0], ' '); }
+    else if (dayWord === 'tonight') partHour = 20;
+  }
+  if (!day && !clock && partHour == null) return null;
+  if (day && !clock && partHour == null && dateStr(day) === dateStr(midnight()) && dayWord !== 'tonight') return null;
+
+  const base = day ? new Date(day) : midnight();
+  const at = (h, m) => { const d = new Date(base); d.setHours(h, m, 0, 0); return d; };
+  let due;
+  if (clock) {
+    if (clock.mer === 'am' || clock.mer === 'pm' || clock.mer === 'x') {
+      let h = clock.h % 12; if (clock.mer === 'pm') h += 12; if (clock.mer === 'x' && clock.h === 12) h = 12;
+      due = at(h, clock.m);
+    } else if (clock.h > 12 || clock.h === 0) due = at(clock.h, clock.m);
+    else {
+      const first = (clock.h >= 7 && clock.h <= 11) ? clock.h : (clock.h % 12) + 12;
+      const second = first === clock.h ? (clock.h % 12) + 12 : clock.h % 12;
+      due = at(first, clock.m);
+      if (!day && due <= now) { const alt = at(second, clock.m); if (alt > now) due = alt; }
+    }
+  } else due = at(partHour != null ? partHour : 9, 0);
+  if (!day && due <= now) due = addDays(due, 1);
+  return { due, text: tidyEdge(t) };
+}
+
+/* pull "due friday" / "by tomorrow" out of a task */
+function parseDue(s) {
+  let m = s.match(new RegExp(',?\\s*\\b(?:due(?:\\s+(?:on|by|for))?|by|before|for)\\s+(' + DAY_SRC + ')\\s*$', 'i')) ||
+          s.match(new RegExp(',?\\s*\\b(?:due(?:\\s+(?:on|by|for))?|by|before)\\s+(' + DAY_SRC + ')\\b', 'i')) ||
+          s.match(new RegExp(',?\\s*\\b(tomorrow|tonight|today|next week|on\\s+(?:' + DAYS.join('|') + '))\\s*$', 'i'));
+  if (!m) return { text: s, due: null };
+  const d = dayFromStr(m[1]);
+  if (!d) return { text: s, due: null };
+  return { text: s.replace(m[0], ' ').replace(/\s{2,}/g, ' ').trim(), due: dateStr(d) };
+}
+
+/* ---------- notes ---------- */
+const titleOf = t => t.length > 56 ? t.slice(0, 56).trim() + '…' : t;
 function createNote(text) {
   const t = cap(text.trim());
-  addMemory('notes', {
-    id: uid(), title: t.length > 56 ? t.slice(0, 56).trim() + '…' : t,
-    body: t.length > 56 ? t : '', created: nowISO(), updated: nowISO()
-  });
+  addMemory('notes', { id: uid(), title: titleOf(t), body: t.length > 56 ? t : '', created: nowISO(), updated: nowISO() });
   return 'I have saved your note.' + syncNote();
 }
 function listNotes() {
@@ -414,27 +575,215 @@ function listNotes() {
   const ns = sortedNotes();
   if (!ns.length) return 'You have no notes yet.';
   const top = ns.slice(0, 3).map(n => n.title).join('; ');
-  return `You have ${ns.length} note${ns.length > 1 ? 's' : ''}. Latest: ${top}.`;
+  return `You have ${plural(ns.length, 'note')}. Latest: ${top}.`;
 }
 function searchNotes(q) {
   go('memory'); ui.noteFilter = q; $('#noteSearch').value = q; renderNotes();
   const hits = sortedNotes().filter(n => noteText(n).toLowerCase().includes(q.toLowerCase()));
   if (!hits.length) return `I found no notes matching ${q}.`;
-  return `I found ${hits.length} note${hits.length > 1 ? 's' : ''} matching ${q}: ${hits.slice(0, 3).map(n => n.title).join('; ')}.`;
+  return `I found ${plural(hits.length, 'note')} matching ${q}: ${hits.slice(0, 3).map(n => n.title).join('; ')}.`;
+}
+const noteSpoken = n => (n.body && n.body !== n.title ? n.title + '. ' + n.body : n.title);
+
+/* ---------- tasks ---------- */
+function createTask(raw) {
+  let { text, prio } = parsePriority(raw);
+  const d = parseDue(text); text = d.text;
+  text = text.replace(/^(?:to|that|about)\s+/i, '');
+  if (!text) return 'What should the task be?';
+  addMemory('tasks', { id: uid(), text: cap(text), priority: prio || 'medium', done: false, due: d.due || null, created: nowISO(), updated: nowISO() });
+  return `Added task: ${cap(text)}${prio ? ', ' + prio + ' priority' : ''}${d.due ? ', due ' + fmtDue(d.due) : ''}.` + syncNote();
+}
+function tryTask(ref, open) {
+  let list = sortedTasks(); if (open) list = list.filter(t => !t.done);
+  return resolveTarget(list, ref, taskText);
+}
+const isOverdue = t => !t.done && t.due && t.due < dateStr(midnight());
+
+/* ---------- undo ---------- */
+function removeWithUndo(col, items, label) {
+  items.forEach(it => deleteMemory(col, it.id));
+  ui.undo = { col, items: items.map(x => ({ ...x })), label };
 }
 
-/* ---- tasks ---- */
-function createTask(raw) {
-  const { text, prio } = parsePriority(raw);
-  if (!text) return 'What should the task be?';
-  addMemory('tasks', { id: uid(), text: cap(text), priority: prio || 'medium', done: false, created: nowISO(), updated: nowISO() });
-  return `Task added with ${prio || 'medium'} priority.` + syncNote();
+/* ---------- timers & reminders ---------- */
+function ensureNotifyPermission() {
+  try { if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission(); } catch (_) {}
 }
+function addReminder(kind, text, due) {
+  addMemory('reminders', { id: uid(), kind, text, due: due.toISOString(), fired: false, created: nowISO(), updated: nowISO() });
+  ensureNotifyPermission();
+  const first = !ui.warned; ui.warned = true;
+  return first ? ' Keep Jarvis open so I can alert you.' : '';
+}
+function makeTimer(ms) {
+  if (ms < 1000) return 'That timer is too short.';
+  const label = fmtDur(ms);
+  const extra = addReminder('timer', label + ' timer', new Date(Date.now() + ms));
+  return `Timer set for ${label}.` + extra + syncNote();
+}
+function makeReminder(rest, needTime, dflt) {
+  const w = findWhen(rest);
+  if (!w) return needTime ? 'When should I remind you? Say something like: remind me in 30 minutes to call mom.' : null;
+  const text = cap(w.text.replace(/^(?:to|that|about)\s+/i, '')) || dflt || 'Reminder';
+  const extra = addReminder('reminder', text, w.due);
+  if (text === 'Alarm') return `Alarm set for ${fmtWhen(w.due)}.` + extra + syncNote();
+  return `Okay. I will remind you ${w.due - Date.now() < 3600000 ? 'in ' + fmtDur(Math.max(60000, Math.round((w.due - Date.now()) / 60000) * 60000)) : fmtWhen(w.due)}${text === 'Reminder' ? '' : ' to ' + text.charAt(0).toLowerCase() + text.slice(1)}.` + extra + syncNote();
+}
+function describeReminder(r) {
+  const due = new Date(r.due);
+  if (r.kind === 'timer') return `${r.text}, ${fmtDur(Math.max(0, due - Date.now()))} left`;
+  return `${r.text} ${fmtWhen(due)}`;
+}
+function beep() {
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return;
+    const ctx = beep.ctx || (beep.ctx = new AC()); if (ctx.state === 'suspended') ctx.resume();
+    [0, 0.35, 0.7].forEach(off => {
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.type = 'sine'; o.frequency.value = 880; o.connect(g); g.connect(ctx.destination);
+      const t0 = ctx.currentTime + off;
+      g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(0.4, t0 + 0.02); g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.28);
+      o.start(t0); o.stop(t0 + 0.3);
+    });
+  } catch (_) {}
+}
+function fireReminder(r) {
+  const missed = Date.now() - new Date(r.due).getTime() > 120000;
+  const msg = r.kind === 'timer' ? `Your ${r.text} is done.` : (missed ? 'You missed a reminder: ' : 'Reminder: ') + r.text + '.';
+  editMemory('reminders', r.id, { fired: true, firedAt: nowISO() });
+  beep(); toast(msg, 'warn', 12000); speak(msg);
+  try { navigator.vibrate && navigator.vibrate([300, 150, 300]); } catch (_) {}
+  try {
+    if ('Notification' in window && Notification.permission === 'granted') {
+      if (navigator.serviceWorker && navigator.serviceWorker.ready)
+        navigator.serviceWorker.ready.then(reg => reg.showNotification('Mars Jarvis', { body: msg, icon: 'icon.svg', tag: r.id })).catch(() => new Notification('Mars Jarvis', { body: msg }));
+      else new Notification('Mars Jarvis', { body: msg });
+    }
+  } catch (_) {}
+  logConversation('(alert)', msg, 'system');
+}
+function checkReminders() {
+  const now = Date.now();
+  data.reminders.filter(r => !r.fired && new Date(r.due).getTime() <= now).forEach(fireReminder);
+  const cutoff = now - 86400000;
+  const before = data.reminders.length;
+  data.reminders = data.reminders.filter(r => !r.fired || new Date(r.due).getTime() > cutoff);
+  if (data.reminders.length !== before) scheduleSave();
+}
+
+/* ---------- web helpers ---------- */
+function toastLink(url, label) {
+  const a = h('a', { href: url, target: '_blank', rel: 'noopener', style: 'color:inherit;text-decoration:underline' }, label);
+  const t = h('div', { class: 'toast warn' }, 'Tap to open: ', a);
+  $('#toasts').append(t); setTimeout(() => t.remove(), 15000);
+}
+function openUrl(url, label) {
+  let w = null;
+  try { w = window.open(url, '_blank'); } catch (_) {}
+  if (!w) toastLink(url, label || url);
+}
+const SITES = {
+  youtube: 'https://www.youtube.com', 'you tube': 'https://www.youtube.com', google: 'https://www.google.com', maps: 'https://www.google.com/maps', 'google maps': 'https://www.google.com/maps',
+  gmail: 'https://mail.google.com', email: 'https://mail.google.com', mail: 'https://mail.google.com', drive: 'https://drive.google.com', 'google drive': 'https://drive.google.com',
+  calendar: 'https://calendar.google.com', 'google calendar': 'https://calendar.google.com', photos: 'https://photos.google.com', 'google photos': 'https://photos.google.com',
+  github: 'https://github.com', wikipedia: 'https://www.wikipedia.org', facebook: 'https://www.facebook.com', messenger: 'https://www.messenger.com',
+  instagram: 'https://www.instagram.com', twitter: 'https://x.com', x: 'https://x.com', tiktok: 'https://www.tiktok.com', spotify: 'https://open.spotify.com',
+  netflix: 'https://www.netflix.com', amazon: 'https://www.amazon.com', whatsapp: 'https://web.whatsapp.com', news: 'https://news.google.com', translate: 'https://translate.google.com',
+  'google translate': 'https://translate.google.com', chatgpt: 'https://chatgpt.com', claude: 'https://claude.ai', reddit: 'https://www.reddit.com', linkedin: 'https://www.linkedin.com'
+};
+const enc = encodeURIComponent;
+const googleSearch = q => { openUrl('https://www.google.com/search?q=' + enc(q), 'Google: ' + q); return `Searching Google for ${q}.`; };
+const youtubeSearch = q => { openUrl('https://www.youtube.com/results?search_query=' + enc(q), 'YouTube: ' + q); return `Searching YouTube for ${q}.`; };
+const mapsSearch = q => { openUrl('https://www.google.com/maps/search/?api=1&query=' + enc(q), 'Maps: ' + q); return `Showing ${q} on Maps.`; };
+const mapsRoute = q => { openUrl('https://www.google.com/maps/dir/?api=1&destination=' + enc(q), 'Directions: ' + q); return `Getting directions to ${q}.`; };
+
+/* ---------- math ---------- */
+function evalMath(src) {
+  let e = src.toLowerCase().replace(/^(?:what(?:'s| is)|calculate|compute|how much is|work out|solve|math|equals?)\s+/, '').replace(/\s*(?:equals?|is it)$/, '').replace(/[?=]+$/, '').trim();
+  if (!e || !/\d/.test(e)) return null;
+  e = e.replace(/(\d),(?=\d{3}\b)/g, '$1')
+       .replace(/(\d+(?:\.\d+)?)\s*(?:%|percent)\s+of\s+(\d+(?:\.\d+)?)/g, '($1/100*$2)')
+       .replace(/square root of\s+(\d+(?:\.\d+)?)/g, 'Math.sqrt($1)')
+       .replace(/(\d+(?:\.\d+)?)\s+squared/g, '($1**2)').replace(/(\d+(?:\.\d+)?)\s+cubed/g, '($1**3)')
+       .replace(/to the power of|\^/g, '**')
+       .replace(/\bplus\b|\band\b/g, '+').replace(/\bminus\b|\bless\b/g, '-')
+       .replace(/\bmultiplied by\b|\btimes\b|\bmultiply by\b/g, '*').replace(/(\d)\s*x\s*(\d)/g, '$1*$2')
+       .replace(/\bdivided by\b|\bover\b|\bdivide by\b/g, '/').replace(/\bmodulo\b|\bmod\b/g, '%');
+  const probe = e.replace(/Math\.sqrt/g, '');
+  if (!/^[\d+\-*/().%\s]+$/.test(probe) || !/[+\-*/%]|sqrt/.test(e)) return null;
+  let v;
+  try { v = Function('"use strict";return (' + e + ')')(); } catch (_) { return null; }
+  if (typeof v !== 'number' || !isFinite(v)) return null;
+  return Math.round(v * 1e6) / 1e6;
+}
+
+/* ---------- fun ---------- */
+const JOKES = [
+  'Why do programmers prefer dark mode? Because light attracts bugs.',
+  'I would tell you a UDP joke, but you might not get it.',
+  'Why did the computer go to the doctor? It had a virus.',
+  'There are only ten kinds of people: those who understand binary and those who do not.',
+  'Why was the JavaScript developer sad? Because he did not know how to null his feelings.',
+  'I asked the fridge for advice. It said, chill.',
+  'Why did the scarecrow win an award? He was outstanding in his field.',
+  'What do you call a fake noodle? An impasta.',
+  'Why do bees have sticky hair? Because they use honeycombs.',
+  'I told my computer I needed a break. Now it will not stop sending me Kit Kat ads.',
+  'Why did the developer go broke? He used up all his cache.',
+  'What is a robot is favorite snack? Microchips.'
+];
+const pick = a => a[Math.floor(Math.random() * a.length)];
+
+/* ---------- weather ---------- */
+const WCODE = { 0: 'clear sky', 1: 'mostly clear', 2: 'partly cloudy', 3: 'overcast', 45: 'foggy', 48: 'foggy', 51: 'light drizzle', 53: 'drizzle', 55: 'heavy drizzle', 56: 'freezing drizzle', 57: 'freezing drizzle',
+  61: 'light rain', 63: 'rain', 65: 'heavy rain', 66: 'freezing rain', 67: 'freezing rain', 71: 'light snow', 73: 'snow', 75: 'heavy snow', 77: 'snow grains', 80: 'rain showers', 81: 'rain showers', 82: 'heavy rain showers',
+  85: 'snow showers', 86: 'snow showers', 95: 'a thunderstorm', 96: 'a thunderstorm with hail', 99: 'a thunderstorm with hail' };
+
+async function geocode(name) {
+  const r = await fetch('https://geocoding-api.open-meteo.com/v1/search?count=1&language=en&name=' + enc(name));
+  const j = await r.json();
+  if (!j.results || !j.results[0]) return null;
+  const p = j.results[0];
+  return { name: [p.name, p.admin1 || p.country].filter(Boolean).join(', '), lat: p.latitude, lon: p.longitude };
+}
+function getPosition() {
+  return new Promise((res, rej) => {
+    if (!navigator.geolocation) return rej(new Error('no geolocation'));
+    navigator.geolocation.getCurrentPosition(p => res({ name: 'your location', lat: p.coords.latitude, lon: p.coords.longitude }), rej, { timeout: 9000, maximumAge: 600000 });
+  });
+}
+async function weatherReport(city) {
+  let place = null;
+  if (city) { place = await geocode(city); if (!place) return `I could not find a place called ${city}.`; }
+  else if (data.settings.home) place = data.settings.home;
+  else { try { place = await getPosition(); } catch (_) { return 'I could not get your location. Say, weather in, followed by a city, or set my city to something.'; } }
+  const u = `https://api.open-meteo.com/v1/forecast?latitude=${place.lat}&longitude=${place.lon}&current=temperature_2m,apparent_temperature,weather_code,wind_speed_10m&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max&timezone=auto&forecast_days=1`;
+  const j = await (await fetch(u)).json();
+  const c = j.current, d = j.daily;
+  const f = x => Math.round(x * 9 / 5 + 32);
+  const t = Math.round(c.temperature_2m);
+  let s = `In ${place.name} it is ${t} degrees Celsius, ${f(c.temperature_2m)} Fahrenheit, with ${WCODE[c.weather_code] || 'unknown conditions'}.`;
+  s += ` Feels like ${Math.round(c.apparent_temperature)}. Today's high is ${Math.round(d.temperature_2m_max[0])} and the low is ${Math.round(d.temperature_2m_min[0])}.`;
+  if (d.precipitation_probability_max && d.precipitation_probability_max[0] != null) s += ` ${d.precipitation_probability_max[0]} percent chance of rain.`;
+  return s;
+}
+async function setHome(city) {
+  const p = await geocode(city);
+  if (!p) return `I could not find a place called ${city}.`;
+  data.settings.home = p; touch();
+  return `Okay. Your city is ${p.name}.` + syncNote();
+}
+
+/* ---------- the parser ---------- */
+const FILLER = /^(?:(?:hey|ok|okay|please|jarvis|yo|hi|so|um|uh|just)[,\s]+|(?:can|could|would|will) you(?: please)?\s+|i want you to\s+|i(?:'d| would) like you to\s+|go ahead and\s+|i(?:'d| would) like to\s+|let's\s+|let me\s+)+/i;
 
 function processCommand(raw) {
-  const s = raw.trim().replace(/[.!?]+$/, '');
+  let s = raw.trim().replace(/[.!?]+$/, '').replace(/\s+/g, ' ');
+  s = s.replace(FILLER, '').replace(/[,\s]+(?:please|for me|thanks|thank you)$/i, '').trim();
   const l = s.toLowerCase();
   let m;
+  if (!s) return 'Yes?';
 
   /* navigation */
   if ((m = l.match(/^(?:go to|open|show me the|switch to|take me to)\s+(?:the\s+)?(home|memory|notes|tasks?|voice|console|settings?)(?:\s+(?:page|section|screen|tab))?$/))) {
@@ -442,80 +791,278 @@ function processCommand(raw) {
     go(v); return `Opening ${v === 'console' ? 'the voice console' : v}.`;
   }
 
-  /* notes */
-  if ((m = s.match(/^(?:save|add|create|take|make|new|write)\s+(?:a\s+|new\s+)?note(?:\s+(?:that|saying|about|to|:))?\s+(.+)$/i)) ||
-      (m = s.match(/^note(?:\s+(?:that|down))?\s+(.+)$/i)) ||
-      (m = s.match(/^remember\s+(?:that\s+)?(.+)$/i))) return createNote(m[1]);
+  /* undo */
+  if (/^(?:undo|undo that|undo it|bring (?:it|them) back|restore (?:it|them|that))$/.test(l)) {
+    const u = ui.undo; if (!u) return 'There is nothing to undo.';
+    u.items.forEach(it => data[u.col].push(it)); ui.undo = null; touch();
+    return 'Restored ' + u.label + '.';
+  }
 
-  if ((m = s.match(/^(?:search|find|look up|look for)\s+(?:my\s+)?notes?\s+(?:for|about|on|with)?\s*(.+)$/i))) return searchNotes(m[1]);
+  /* ---- timers, alarms & reminders ---- */
+  if ((m = l.match(/^how (?:much time|long)(?: is)?(?: left| remaining)?(?: on (?:the|my) timer)?$/)) || /^(?:time left|how much time is left)/.test(l)) {
+    const t = activeReminders().filter(r => r.kind === 'timer')[0];
+    return t ? `${fmtDur(Math.max(0, new Date(t.due) - Date.now()))} left on your ${t.text}.` : 'You have no running timers.';
+  }
+  if (/^(?:what|which|show|list|read|any|do i have|are there|tell me)\b/.test(l) && /\b(?:timers?|reminders?|alarms?)\b/.test(l) && !/\bremind me\b/.test(l)) {
+    const wantT = /timer/.test(l), wantR = /reminder|alarm/.test(l);
+    const list = activeReminders().filter(r => (wantT && r.kind === 'timer') || (wantR && r.kind !== 'timer') || (!wantT && !wantR));
+    go('home');
+    if (!list.length) return wantT ? 'You have no running timers.' : 'You have no upcoming reminders.';
+    return `You have ${plural(list.length, wantT && !wantR ? 'timer' : 'item')}: ` + list.slice(0, 5).map(describeReminder).join('; ') + '.';
+  }
+  if ((m = l.match(/^(?:cancel|stop|delete|remove|clear|dismiss|turn off|kill)\s+(all\s+)?(?:the\s+|my\s+|that\s+)?(?:(?:running|active|upcoming)\s+)?(timer|reminder|alarm)s?(?:\s+(.+))?$/))) {
+    const kindIsTimer = m[2] === 'timer';
+    const list = activeReminders().filter(r => kindIsTimer ? r.kind === 'timer' : r.kind !== 'timer');
+    if (!list.length) return kindIsTimer ? 'You have no running timers.' : 'You have no upcoming reminders.';
+    let targets;
+    if (m[1] || /^all$/.test((m[3] || '').trim())) targets = list;
+    else if (m[3]) { const t = resolveTarget(list, m[3].replace(/^(?:number|no\.?)\s*/, ''), remText); targets = t ? [t] : []; if (!t) return `I couldn't find a ${m[2]} matching ${m[3]}.`; }
+    else targets = [list[0]];
+    targets.forEach(t => deleteMemory('reminders', t.id));
+    return targets.length > 1 ? `Cancelled ${plural(targets.length, m[2])}.` : `Cancelled: ${targets[0].text}.`;
+  }
+  if (/\btimers?\b/.test(l) && !/\bremind/.test(l) && !/^help/.test(l)) {
+    const ms = parseDur(l);
+    return ms ? makeTimer(ms) : 'How long should the timer be? Say, set a timer for 10 minutes.';
+  }
+  if ((m = l.match(/^(?:set|create|make|add|start)\s+(?:me\s+)?(?:an?\s+)?(alarm|reminder)(?:\s+(.*))?$/))) {
+    const r = makeReminder(m[2] || '', true, m[1] === 'alarm' ? 'Alarm' : ''); return r || 'When should I remind you?';
+  }
+  if ((m = s.match(/^wake me(?: up)?\s+(.+)$/i))) { const w = findWhen(m[1]); if (w) return makeReminder('wake up ' + m[1], true); }
+  if ((m = s.match(/^remind me\s+(.+)$/i))) {
+    const r = makeReminder(m[1], false); if (r) return r;
+    return createTask(m[1]);
+  }
+  if ((m = s.match(/^(?:remember|don't forget|do not forget|don't let me forget)\s+to\s+(.+)$/i))) {
+    const r = makeReminder(m[1], false); if (r) return r;
+    if (/forget/i.test(s)) return createTask(m[1]);
+  }
 
-  if (/^(?:show|list|read|open|display)\s+(?:me\s+)?(?:all\s+)?(?:my\s+|the\s+)?notes?$/.test(l) || l === 'what are my notes') return listNotes();
+  /* ---- notes ---- */
+  if ((m = s.match(/^(?:read|tell me|show me)\s+(?:me\s+)?(?:the\s+|my\s+)?(first|last|latest|newest|oldest|\d+|one|two|three|four|five)?\s*note(?:\s+(.+))?$/i)) && (m[1] || m[2])) {
+    const ref = (m[1] || m[2]).trim();
+    const list = sortedNotes();
+    const n = /^(?:first|newest|latest)$/i.test(ref) ? list[0] : /^(?:last|oldest)$/i.test(ref) ? list[list.length - 1] : resolveTarget(list, ref, noteText);
+    return n ? noteSpoken(n) + '.' : `I couldn't find a note matching ${ref}.`;
+  }
+  if (/^read\s+(?:me\s+)?(?:all\s+)?(?:my\s+|the\s+)?notes?(?:\s+(?:out loud|aloud|to me))?$/.test(l)) {
+    go('memory');
+    const ns = sortedNotes();
+    if (!ns.length) return 'You have no notes yet.';
+    return `You have ${plural(ns.length, 'note')}. ` + ns.slice(0, 5).map((n, i) => `Note ${i + 1}: ${noteSpoken(n)}.`).join(' ') + (ns.length > 5 ? ' That is the latest five.' : '');
+  }
 
+  if ((m = s.match(/^(?:rename|retitle)\s+note\s+(.+?)\s+(?:to|as)\s+(.+)$/i))) {
+    const n = resolveTarget(sortedNotes(), m[1], noteText);
+    if (!n) return `I couldn't find a note matching ${m[1]}.`;
+    editMemory('notes', n.id, { title: titleOf(cap(m[2].trim())) });
+    return `Note renamed to ${cap(m[2].trim())}.`;
+  }
   if ((m = s.match(/^(?:edit|update|change|rewrite)\s+note\s+(.+?)\s+(?:to|so it says|saying)\s+(.+)$/i))) {
     const n = resolveTarget(sortedNotes(), m[1], noteText);
     if (!n) return `I couldn't find a note matching ${m[1]}.`;
     const t = cap(m[2].trim());
-    editMemory('notes', n.id, { title: t.length > 56 ? t.slice(0, 56).trim() + '…' : t, body: t.length > 56 ? t : '' });
+    editMemory('notes', n.id, { title: titleOf(t), body: t.length > 56 ? t : '' });
     return 'Note updated.';
   }
-
-  if ((m = s.match(/^(?:delete|remove|erase|trash)\s+(?:the\s+)?note\s+(.+)$/i))) {
+  if ((m = s.match(/^(?:delete|remove|erase|trash|get rid of)\s+(?:the\s+)?note\s+(.+)$/i))) {
     const n = resolveTarget(sortedNotes(), m[1], noteText);
     if (!n) return `I couldn't find a note matching ${m[1]}.`;
-    deleteMemory('notes', n.id); return `Deleted the note: ${n.title}.`;
+    removeWithUndo('notes', [n], 'your note'); return `Deleted the note: ${n.title}. Say undo to bring it back.`;
+  }
+  if ((m = s.match(/^(?:search|find|look up|look for)\s+(?:my\s+)?notes?\s+(?:for|about|on|with)?\s*(.+)$/i))) return searchNotes(m[1]);
+  if (/^(?:show|list|display|open)\s+(?:me\s+)?(?:all\s+)?(?:my\s+|the\s+)?notes?$/.test(l) || /^what (?:are my notes|notes do i have)$/.test(l)) return listNotes();
+
+  if ((m = s.match(/^(?:save|add|create|take|make|new|write|jot|put)\s+(?:down\s+)?(?:a\s+|new\s+|this\s+)?note(?:\s+(?:that|saying|about|to|of|:))?\s+(.+)$/i)) ||
+      (m = s.match(/^(?:jot|write|put|scribble|type|note)\s+(?:this\s+)?down(?:\s+(?:that|:))?\s+(.+)$/i)) ||
+      (m = s.match(/^note to self[:,]?\s+(.+)$/i)) ||
+      (m = s.match(/^(?:save|add|put|store|keep)\s+(.+?)\s+(?:in|to|into|on)\s+(?:my\s+|the\s+)?notes?$/i)) ||
+      (m = s.match(/^note(?:\s+(?:that|down))?\s+(.+)$/i)) ||
+      (m = s.match(/^remember\s+(?:that\s+)?(.+)$/i))) return createNote(m[1]);
+
+  /* ---- tasks ---- */
+  if ((m = s.match(/^(?:set|change|move|update|make)\s+(?:the\s+)?(?:due date (?:of|for)\s+)?task\s+(.+?)\s+(?:to be\s+)?(?:due|due date)\s+(?:on\s+|by\s+|for\s+|to\s+)?(.+)$/i)) ||
+      (m = s.match(/^(?:set|change|update)\s+(?:the\s+)?due date (?:of|for) task\s+(.+?)\s+(?:to|as|for)\s+(.+)$/i)) ||
+      (m = s.match(/^task\s+(.+?)\s+is due\s+(?:on\s+|by\s+)?(.+)$/i))) {
+    const t = tryTask(m[1]);
+    if (!t) return `I couldn't find a task matching ${m[1]}.`;
+    const d = dayFromStr(m[2].trim());
+    if (!d) return `I didn't understand the date ${m[2]}. Try tomorrow, Friday, or March 5.`;
+    editMemory('tasks', t.id, { due: dateStr(d) });
+    return `Task due ${fmtDue(dateStr(d))}: ${t.text}.`;
   }
 
-  /* tasks */
   if ((m = s.match(/^(?:add|create|new|make)\s+(?:a\s+|an\s+|new\s+)?(?:(?:high|medium|low|urgent|critical)[\s-]*priority\s+)?task(?:\s+(?:to|for|called|:))?\s*(.*)$/i))) {
     const prefix = s.match(/(high|medium|low|urgent|critical)[\s-]*priority\s+task/i);
     return createTask((prefix ? prefix[1] + ' priority ' : '') + m[1]);
   }
-  if ((m = s.match(/^remind me to\s+(.+)$/i))) return createTask(m[1]);
 
-  if ((m = s.match(/^(?:complete|finish|finished|check off|tick off)\s+(?:the\s+)?task\s+(.+)$/i)) ||
+  if ((m = s.match(/^(?:complete|finish|finished|done with|check off|tick off|cross off)\s+(?:the\s+)?task\s+(.+)$/i)) ||
       (m = s.match(/^mark\s+(?:the\s+)?task\s+(.+?)\s+(?:as\s+)?(?:done|complete|completed|finished)$/i)) ||
-      (m = s.match(/^(?:task)\s+(.+?)\s+(?:is\s+)?(?:done|complete|completed)$/i))) {
-    const t = resolveTarget(sortedTasks(), m[1], taskText);
+      (m = s.match(/^task\s+(.+?)\s+(?:is\s+)?(?:done|complete|completed|finished)$/i))) {
+    const t = tryTask(m[1], false);
     if (!t) return `I couldn't find a task matching ${m[1]}.`;
     editMemory('tasks', t.id, { done: true, completed: nowISO() });
     return `Marked complete: ${t.text}.`;
   }
-
-  if ((m = s.match(/^(?:delete|remove|cancel)\s+(?:the\s+)?task\s+(.+)$/i))) {
-    const t = resolveTarget(sortedTasks(), m[1], taskText);
+  if ((m = s.match(/^(?:reopen|uncomplete|un-complete|mark)\s+(?:the\s+)?task\s+(.+?)(?:\s+(?:as\s+)?(?:not done|open|incomplete|undone))?$/i)) && /^(?:reopen|uncomplete|un-complete)|(?:not done|open|incomplete|undone)$/i.test(s)) {
+    const t = tryTask(m[1], false);
     if (!t) return `I couldn't find a task matching ${m[1]}.`;
-    deleteMemory('tasks', t.id); return `Deleted the task: ${t.text}.`;
+    editMemory('tasks', t.id, { done: false, completed: null });
+    return `Reopened: ${t.text}.`;
+  }
+
+  if ((m = s.match(/^(?:clear|delete|remove|get rid of|clean up|wipe)\s+(?:all\s+)?(?:the\s+|my\s+)?(?:completed|done|finished|checked)\s+tasks?$/i)) ||
+      (m = s.match(/^(?:clear|delete|remove)\s+(?:all\s+)?tasks? that (?:are|i(?:'ve| have)) (?:done|completed|finished)$/i))) {
+    const done = data.tasks.filter(t => t.done);
+    if (!done.length) return 'You have no completed tasks to clear.';
+    removeWithUndo('tasks', done, 'your tasks');
+    return `Cleared ${plural(done.length, 'completed task')}. Say undo to bring them back.`;
+  }
+
+  if ((m = s.match(/^(?:rename|edit|update|change|reword)\s+task\s+(.+?)\s+to\s+(.+)$/i))) {
+    const t = tryTask(m[1]);
+    if (!t) return `I couldn't find a task matching ${m[1]}.`;
+    editMemory('tasks', t.id, { text: cap(m[2].trim()) });
+    return 'Task updated.';
+  }
+
+  if ((m = s.match(/^(?:delete|remove|cancel|scrap)\s+(?:the\s+)?task\s+(.+)$/i))) {
+    const t = tryTask(m[1]);
+    if (!t) return `I couldn't find a task matching ${m[1]}.`;
+    removeWithUndo('tasks', [t], 'your task'); return `Deleted the task: ${t.text}. Say undo to bring it back.`;
   }
 
   if ((m = s.match(/^(?:set|change|make|update)\s+(?:the\s+)?(?:priority\s+of\s+)?task\s+(.+?)\s+(?:priority\s+)?(?:to|as)?\s*(high|medium|low|urgent|critical)(?:\s+priority)?$/i)) ||
       (m = s.match(/^(?:set|change|make|update)\s+(?:the\s+)?priority\s+of\s+task\s+(.+?)\s+to\s+(high|medium|low|urgent|critical)$/i)) ||
       (m = s.match(/^prioriti[sz]e\s+task\s+(.+?)(?:\s+as\s+(high|medium|low))?$/i))) {
-    const t = resolveTarget(sortedTasks(), m[1], taskText);
+    const t = tryTask(m[1]);
     if (!t) return `I couldn't find a task matching ${m[1]}.`;
     let p = (m[2] || 'high').toLowerCase(); if (p === 'urgent' || p === 'critical') p = 'high';
     editMemory('tasks', t.id, { priority: p });
     return `Task priority set to ${p}.`;
   }
 
-  if (/^(?:show|list|read|display)\s+(?:me\s+)?(?:all\s+)?(?:my\s+|the\s+)?tasks?$/.test(l) || /^what(?:'s| is| are)\s+(?:on\s+)?my\s+(?:tasks?|to-?do(?: list)?)$/.test(l)) {
+  if ((m = l.match(/^(?:what(?:'s| is| are)?|show|list|any|which)\s*(?:me\s+)?(?:my\s+|the\s+|all\s+)?(?:tasks?\s+)?(overdue|late|due(?:\s+(today|tomorrow|this week))?)(?:\s+tasks?)?$/)) ||
+      (m = l.match(/^(?:what(?:'s| is| are)?|show|list)\s+(?:me\s+)?(?:my\s+)?(overdue|late)\s+tasks?$/))) {
+    go('tasks');
+    const today = dateStr(midnight()), tmr = dateStr(addDays(midnight(), 1)), wk = dateStr(addDays(midnight(), 7));
+    const scope = m[2] || (/overdue|late/.test(m[1]) ? 'overdue' : 'any');
+    const open = sortedTasks().filter(t => !t.done && t.due);
+    const hit = open.filter(t => scope === 'overdue' ? t.due < today : scope === 'today' ? t.due === today : scope === 'tomorrow' ? t.due === tmr : scope === 'this week' ? t.due <= wk : true);
+    if (!hit.length) return scope === 'overdue' ? 'You have no overdue tasks.' : `You have nothing due${scope === 'any' ? ' yet' : ' ' + scope}.`;
+    return `${plural(hit.length, 'task')} ${scope === 'overdue' ? 'overdue' : 'due'}: ` + hit.slice(0, 5).map(t => `${t.text}, ${fmtDue(t.due)}`).join('; ') + '.';
+  }
+
+  if (/^read\s+(?:me\s+)?(?:all\s+)?(?:my\s+|the\s+)?(?:tasks?|to-?do(?: list)?)(?:\s+(?:out loud|aloud|to me))?$/.test(l)) {
     go('tasks');
     const open = sortedTasks().filter(t => !t.done);
     if (!open.length) return 'You have no open tasks.';
-    return `You have ${open.length} open task${open.length > 1 ? 's' : ''}. Top priority: ${open.slice(0, 3).map(t => t.text).join('; ')}.`;
+    return `You have ${plural(open.length, 'open task')}. ` + open.slice(0, 8).map((t, i) => `${i + 1}: ${t.text}${t.due ? ', due ' + fmtDue(t.due) : ''}.`).join(' ');
+  }
+  if (/^(?:show|list|display)\s+(?:me\s+)?(?:all\s+)?(?:my\s+|the\s+)?tasks?$/.test(l) || /^what(?:'s| is| are)\s+(?:on\s+)?my\s+(?:tasks?|to-?do(?: list)?|list)$/.test(l) || /^what do i have to do$/.test(l)) {
+    go('tasks');
+    const open = sortedTasks().filter(t => !t.done);
+    if (!open.length) return 'You have no open tasks.';
+    return `You have ${plural(open.length, 'open task')}. Top priority: ${open.slice(0, 3).map(t => t.text).join('; ')}.`;
   }
 
-  /* utilities */
-  if (/\bwhat(?:'s| is)?\s+the\s+time\b|^what time is it$|^time$/.test(l)) return 'It is ' + new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) + '.';
-  if (/\b(?:what(?:'s| is)?\s+(?:the\s+)?(?:date|day)|today'?s date)\b/.test(l)) return 'Today is ' + new Date().toLocaleDateString([], { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' }) + '.';
-  if (/^(?:hello|hi|hey|good (?:morning|afternoon|evening))$/.test(l)) return 'Hello. All systems are online.';
-  if (/^(?:thanks|thank you)$/.test(l)) return 'You are welcome.';
-  if (/^(?:mute|be quiet|silence)$/.test(l)) { setMuted(true); return ''; }
+  /* ---- counts ---- */
+  if ((m = l.match(/^how many\s+(.+)$/)) && /\b(?:notes?|tasks?|to-?dos?|reminders?|timers?|commands?)\b/.test(m[1])) {
+    const w = m[1];
+    if (/note/.test(w)) return `You have ${plural(data.notes.length, 'note')}.`;
+    if (/timer/.test(w)) return `You have ${plural(activeReminders().filter(r => r.kind === 'timer').length, 'running timer')}.`;
+    if (/reminder/.test(w)) return `You have ${plural(activeReminders().filter(r => r.kind !== 'timer').length, 'upcoming reminder')}.`;
+    if (/command/.test(w)) return `You have run ${plural(data.conversations.length, 'command')}.`;
+    if (/overdue|late/.test(w)) return `You have ${plural(data.tasks.filter(isOverdue).length, 'overdue task')}.`;
+    if (/done|completed|finished/.test(w)) return `You have completed ${plural(data.tasks.filter(t => t.done).length, 'task')}.`;
+    return `You have ${plural(data.tasks.filter(t => !t.done).length, 'open task')}.`;
+  }
+
+  /* ---- natural phrasing for tasks ---- */
+  if ((m = s.match(/^(?:add|put|stick|throw)\s+(.+?)\s+(?:to|on|onto|in|into)\s+(?:my\s+|the\s+)?(?:tasks?|to-?do|todo|task list|to-?do list|todo list|list|checklist)$/i))) return createTask(m[1]);
+  if ((m = s.match(/^(?:i(?:'ve| have)?\s+(?:need to|have to|got to|gotta|must|ought to|should)|i(?:'ll| will) need to|i need to|we need to|don't let me forget to|do not forget to|don't forget to)\s+(.+)$/i))) return createTask(m[1]);
+  if ((m = s.match(/^(?:to-?do|to do|todo|new to-?do)[:\s]+(.+)$/i))) return createTask(m[1]);
+  if ((m = s.match(/^(?:i(?:'ve| have)?\s+)?(?:finished|completed|done with|done)\s+(.+)$/i))) {
+    const t = tryTask(m[1], true);
+    if (t) { editMemory('tasks', t.id, { done: true, completed: nowISO() }); return `Nice work. Marked complete: ${t.text}.`; }
+  }
+  if ((m = s.match(/^mark\s+(.+?)\s+(?:as\s+)?(?:done|complete|completed|finished)$/i))) {
+    const t = tryTask(m[1], true);
+    if (t) { editMemory('tasks', t.id, { done: true, completed: nowISO() }); return `Marked complete: ${t.text}.`; }
+  }
+
+  /* ---- utilities ---- */
+  if (/\bwhat(?:'s| is)?\s+the\s+time\b|^what time is it$|^time$|^what(?:'s| is) the time now$/.test(l)) return 'It is ' + new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) + '.';
+  if (/\b(?:what(?:'s| is)?\s+(?:the\s+)?(?:date|day)|today'?s date)\b/.test(l) && !/\d/.test(l)) return 'Today is ' + new Date().toLocaleDateString([], { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' }) + '.';
+  if (/^(?:hello|hi|hey|good (?:morning|afternoon|evening)|yo|sup)$/.test(l)) return 'Hello. All systems are online.';
+  if (/^(?:thanks|thank you|thanks jarvis|thank you jarvis)$/.test(l)) return 'You are welcome.';
+  if (/^how are you(?: doing)?(?: today)?$/.test(l)) return 'All systems nominal. Ready when you are.';
+  if (/^(?:who are you|what(?:'s| is) your name|what are you)$/.test(l)) return 'I am Mars Jarvis, your personal AI operating system.';
+  if (/^good night$/.test(l)) return 'Good night. I will keep watch.';
+  if (/^(?:mute|be quiet|silence|shut up)$/.test(l)) { setMuted(true); return ''; }
   if (/^unmute$/.test(l)) { setMuted(false); return 'Voice restored.'; }
   if (/^(?:stop listening|go to sleep|sleep)$/.test(l)) { setTimeout(stopListening, 1500); return 'Going quiet. Say start listening on the console to wake me.'; }
-  if (/^(?:help|what can you do)$/.test(l))
-    return 'I can save, show, search, edit and delete notes, and add, complete, delete and prioritise tasks. Try: add note blockchain idea, or add high priority task call mom.';
 
-  return "I didn't recognise that command. Say help to hear what I can do.";
+  if (/\bjokes?\b|^make me laugh$|^say something funny$/.test(l)) {
+    let j; do { j = pick(JOKES); } while (j === ui.lastJoke && JOKES.length > 1);
+    ui.lastJoke = j; return j;
+  }
+  if (/^(?:flip|toss)\s+(?:a\s+)?coin$/.test(l)) return Math.random() < 0.5 ? 'Heads.' : 'Tails.';
+  if (/^(?:roll|throw)\s+(?:a\s+|the\s+)?(?:die|dice|d6)$/.test(l)) return `You rolled a ${1 + Math.floor(Math.random() * 6)}.`;
+  if ((m = l.match(/^(?:pick|give me|choose|random)\s+(?:a\s+)?(?:random\s+)?number(?:\s+between\s+(\d+)\s+(?:and|to)\s+(\d+))?$/))) {
+    let a = m[1] ? +m[1] : 1, b = m[2] ? +m[2] : 100; if (a > b) [a, b] = [b, a];
+    return `${a + Math.floor(Math.random() * (b - a + 1))}.`;
+  }
+  if ((m = l.match(/^(?:pick|choose|decide)\s+(?:between\s+)?(.+?)\s+or\s+(.+)$/))) return `I choose ${Math.random() < 0.5 ? m[1] : m[2]}.`;
+
+  if ((m = l.match(/^(?:set|change|update)\s+(?:my\s+)?(?:city|location|home|town)\s+(?:to|as|is)\s+(.+)$/)) || (m = l.match(/^(?:my (?:city|location|home) is|i live in|i(?:'m| am) in)\s+(.+)$/)))
+    return setHome(m[1]);
+  if (!/^help/.test(l) && (/\b(?:weather|forecast|temperature)\b/.test(l) || /^(?:is it|will it|do i need|should i bring).*\b(?:rain|raining|umbrella|snow|hot|cold|sunny)\b/.test(l))) {
+    const c = l.match(/\b(?:in|for|at)\s+(?!the\b|my\b|today\b|tomorrow\b|now\b|here\b)([a-z][a-z\s.,'-]*?)(?:\s+(?:today|tomorrow|right now|now))?$/);
+    return weatherReport(c ? c[1].trim() : '');
+  }
+
+  const calc = evalMath(l);
+  if (calc !== null) return `${calc}.`;
+
+  /* ---- web ---- */
+  if ((m = l.match(/^(?:open|launch|go to|visit|pull up|take me to|start)\s+(?:the\s+)?(?:website\s+)?([a-z0-9 .\/-]+?)(?:\s+(?:app|website|site|page))?$/))) {
+    const key = m[1].trim();
+    if (SITES[key]) { openUrl(SITES[key], cap(key)); return `Opening ${cap(key)}.`; }
+    if (/^[a-z0-9-]+(?:\.[a-z0-9-]+)+(?:\/\S*)?$/.test(key)) { openUrl('https://' + key, key); return `Opening ${key}.`; }
+  }
+  if ((m = s.match(/^(?:search\s+)?(?:you ?tube)\s+(?:for\s+)?(.+)$/i)) || (m = s.match(/^(?:search|look up|find|show me)\s+(.+?)\s+on\s+you ?tube$/i)) || (m = s.match(/^play\s+(.+?)\s+on\s+you ?tube$/i)) || (m = s.match(/^play\s+(.+)$/i)))
+    return youtubeSearch(m[1]);
+  if ((m = s.match(/^(?:navigate|directions?|route|take me|drive|walk|get directions?|how do i get)\s+(?:me\s+)?(?:to|for)\s+(.+)$/i)))
+    return mapsRoute(m[1]);
+  if ((m = s.match(/^(?:find|show|search for|look for|where(?:'s| is)?)\s+(?:me\s+)?(?:the\s+)?(?:nearest|closest|nearby)\s+(.+)$/i)) || (m = s.match(/^(?:nearest|closest)\s+(.+)$/i))) return mapsSearch(m[1] + ' near me');
+  if ((m = s.match(/^(?:find|show|search for|look for)\s+(?:me\s+)?(.+?)\s+(?:near me|nearby|around here|near here)$/i))) return mapsSearch(m[1] + ' near me');
+  if ((m = s.match(/^(?:find|show|search|look up|where is|where's)\s+(.+?)\s+(?:on|in|using)\s+(?:google\s+)?maps$/i)) || (m = s.match(/^(?:maps?|map of)\s+(.+)$/i))) return mapsSearch(m[1]);
+  if ((m = s.match(/^(?:wikipedia|wiki)\s+(?:for\s+|about\s+)?(.+)$/i))) { openUrl('https://en.wikipedia.org/wiki/Special:Search?search=' + enc(m[1]), 'Wikipedia: ' + m[1]); return `Looking up ${m[1]} on Wikipedia.`; }
+  if ((m = s.match(/^(?:google|search google for|search for|search the web for|search the internet for|search online for|web search|search|look up|look)\s+(?:for\s+)?(.+)$/i)) || (m = s.match(/^(?:find me|find)\s+(?:information|info)\s+(?:on|about)\s+(.+)$/i)))
+    return googleSearch(m[1]);
+  if (/^(?:who|what|when|where|why|how|which)\b.{4,}/.test(l)) return googleSearch(s);
+
+  /* ---- help ---- */
+  if (/^(?:help|what can you do|commands|what do you know)$/.test(l))
+    return 'I can save and read notes, manage tasks with priorities and due dates, set timers and reminders, do quick math, search Google, YouTube and Maps, check the weather, and tell jokes. Try: set a timer for 10 minutes, or remind me at 5 pm to call mom.';
+  if ((m = l.match(/^help(?: me)? with\s+(notes?|tasks?|timers?|reminders?|web|search|weather|math|fun)$/))) {
+    const h2 = {
+      note: 'For notes say: jot down something, read my notes, read note 2, rename note 2 to something, search notes for something, delete note 2.',
+      task: 'For tasks say: I need to call mom, add high priority task pay rent due friday, complete task 1, clear completed tasks, what is overdue, how many tasks.',
+      timer: 'For timers say: set a timer for 10 minutes, how much time is left, cancel the timer.',
+      reminder: 'For reminders say: remind me in 30 minutes to stretch, remind me tomorrow at 9 to call mom, cancel all reminders.',
+      web: 'For the web say: google something, search YouTube for something, directions to a place, open Gmail, open Maps.',
+      search: 'For the web say: google something, search YouTube for something, directions to a place, open Gmail, open Maps.',
+      weather: 'Say: what is the weather, or weather in Manila, or set my city to Baguio.',
+      math: 'Say: what is 15 percent of 80, or 12 times 7, or square root of 144.',
+      fun: 'Say: tell me a joke, flip a coin, roll a dice, or pick a number between 1 and 10.'
+    };
+    return h2[m[1].replace(/s$/, '')] || h2.web;
+  }
+
+  return "I didn't recognise that command. Say help, or say google followed by what you want to find.";
 }
 
 function runCommand(text, source = 'text') {
@@ -524,8 +1071,11 @@ function runCommand(text, source = 'text') {
   let reply;
   try { reply = processCommand(input); }
   catch (e) { console.error(e); reply = 'Something went wrong running that command.'; }
-  logConversation(input, reply, source);
-  if (reply) { speak(reply); if (data.settings.muted) toast(reply); }
+  const finish = r => { logConversation(input, r, source); if (r) { speak(r); if (data.settings.muted) toast(r); } };
+  if (reply && typeof reply.then === 'function') {
+    toast('Working on it…');
+    reply.then(finish, e => { console.error(e); finish('I could not reach the internet for that.'); });
+  } else finish(reply);
 }
 
 function logConversation(input, reply, source) {
@@ -542,7 +1092,7 @@ function setMuted(v) {
 
 /* ================= RENDERING ================= */
 function renderAll() {
-  renderHome(); renderNotes(); renderTasks(); renderHistory(); renderMemoryMeta(); renderAuth(); renderSettings();
+  renderHome(); renderNotes(); renderTasks(); renderReminders(); renderHistory(); renderMemoryMeta(); renderAuth(); renderSettings();
 }
 
 function renderHome() {
@@ -597,12 +1147,24 @@ function renderTasks() {
     ul.append(h('li', { class: `task p-${t.priority} ${t.done ? 'done' : ''}` },
       h('span', { class: 'num' }, '#' + (i + 1)),
       h('button', { class: 'check', title: t.done ? 'Mark open' : 'Complete', onclick: () => editMemory('tasks', t.id, { done: !t.done, completed: t.done ? null : nowISO() }) }, t.done ? '✓' : ''),
-      h('span', { class: 't-text' }, t.text),
+      h('span', { class: 't-text' }, t.text, t.due ? h('small', { style: 'margin-left:8px;opacity:.85;color:' + (isOverdue(t) ? 'var(--red)' : 'var(--gold)') }, (isOverdue(t) ? 'overdue · ' : 'due ') + fmtDue(t.due)) : null),
       h('button', {
         class: 'badge ' + t.priority, title: 'Click to change priority',
         onclick: () => editMemory('tasks', t.id, { priority: { high: 'medium', medium: 'low', low: 'high' }[t.priority] })
       }, t.priority),
       h('button', { class: 'icon-btn', title: 'Delete', onclick: () => deleteMemory('tasks', t.id) }, '✕')));
+  });
+}
+
+function renderReminders() {
+  const ul = $('#remList'); if (!ul) return;
+  const list = activeReminders();
+  ul.innerHTML = '';
+  if (!list.length) { ul.append(h('li', { class: 'empty' }, 'Nothing scheduled. Say “Jarvis, set a timer for 10 minutes”.')); return; }
+  list.slice(0, 6).forEach(r => {
+    const due = new Date(r.due);
+    const info = r.kind === 'timer' ? '⏱ ' + fmtDur(Math.max(0, due - Date.now())) + ' left' : '🔔 ' + fmtWhen(due);
+    ul.append(h('li', {}, r.text, h('span', { class: 'meta' }, info + ' · '), h('button', { class: 'btn small', style: 'margin-left:6px', onclick: () => deleteMemory('reminders', r.id) }, 'Cancel')));
   });
 }
 
@@ -617,7 +1179,7 @@ function renderHistory() {
 }
 
 function renderMemoryMeta() {
-  const parts = [`${data.notes.length} notes`, `${data.tasks.length} tasks`, `${data.research.length} research`, `${data.conversations.length} conversations`];
+  const parts = [`${data.notes.length} notes`, `${data.tasks.length} tasks`, `${data.reminders.filter(r => !r.fired).length} reminders`, `${data.research.length} research`, `${data.conversations.length} conversations`];
   let s = parts.join(' · ');
   if (!signedIn()) s += ' · Not connected: data lives in this tab only.';
   else if (sync.lastSaved) s += ' · Last saved ' + fmtTime(sync.lastSaved);
@@ -733,6 +1295,8 @@ function wire() {
 }
 
 /* ================= BOOT ================= */
+const CHEATS = [["Jarvis, jot down blockchain idea","read my notes","read note 2","rename note 1 to …"],["I need to call mom","add high priority task pay rent due friday"],["complete task 1","clear completed tasks","what is overdue","undo"],["set a timer for 10 minutes","how much time is left","cancel the timer"],["remind me at 5 pm to call mom","remind me in 30 minutes to stretch"],["google best phone 2026","search YouTube for lofi","directions to SM Baguio","open Gmail"],["what is 15 percent of 80","weather in Manila","tell me a joke","help"]];
+
 function boot() {
   wire();
   populateVoices();
@@ -746,6 +1310,19 @@ function boot() {
   if (!synth) $('#btnMute').disabled = true;
   const tick = () => { $('#clock').textContent = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }); };
   tick(); setInterval(tick, 1000);
+
+  /* Phase 2 UI additions: timers panel, new cheat sheet, label */
+  const brand = $('.brand-text span'); if (brand) brand.textContent = 'JARVIS · PHASE 2';
+  const cheats = $('.cheats');
+  if (cheats) {
+    const grid = cheats.parentElement.parentElement;
+    const panel = h('div', { class: 'glass panel' }, h('h3', {}, 'Timers & reminders'), h('ul', { id: 'remList', class: 'list' }));
+    grid.insertBefore(panel, cheats.parentElement);
+    cheats.innerHTML = '';
+    CHEATS.forEach(line => cheats.append(h('li', {}, line.map((c, i) => [i ? ' · ' : '', h('code', {}, c)]))));
+  }
+  const hi = $('#homeInput'); if (hi) hi.placeholder = 'Try: "remind me in 30 minutes to stretch"';
+  setInterval(() => { checkReminders(); renderReminders(); }, 1000);
   setSync('offline'); renderAll(); updateVoiceUI();
   if (data.settings.autoListen && SR) startListening();
 }
