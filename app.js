@@ -1,5 +1,5 @@
 /* =========================================================
-   MARS JARVIS · Phase 2 (more commands)
+   MARS JARVIS · Phase 3 (AI brain + auto sign-in)
    Vanilla JS · Google Identity Services · Drive API · Web Speech API
    No backend, no database, no framework.
    All persistent memory lives in Google Drive: jarvis_data.json
@@ -53,7 +53,9 @@ const blankData = () => ({
 });
 let data = blankData();
 const sync = { status: 'offline', fileId: null, user: null, saving: false, again: false, timer: null, lastSaved: null };
-const ui = { view: 'home', editingNote: null, noteFilter: '', undo: null, warned: false, lastJoke: '' };
+const ui = { view: 'home', editingNote: null, noteFilter: '', undo: null, warned: false, lastJoke: '', chat: [], lastAnswer: '', noBrain: false };
+const ext = { pre: [], fallback: [], api: null };   // plugin hooks for future phases
+window.MarsJarvisExt = ext;
 
 function normalize(d) {
   const b = blankData();
@@ -69,8 +71,11 @@ function normalize(d) {
 }
 
 /* ================= GOOGLE AUTH ================= */
-const auth = { token: null, expires: 0, client: null, pending: null };
+const REMEMBER_KEY = 'mars_jarvis_remember';       // "this device was connected before" (config only)
+const EMAIL_KEY    = 'mars_jarvis_email';          // hint so Google can sign in silently
+const auth = { token: null, expires: 0, client: null, pending: null, promise: null, refreshTimer: null, needTap: false, tapArmed: false };
 const getClientId = () => (localStorage.getItem(CLIENT_ID_KEY) || DEFAULT_CLIENT_ID).trim();
+const remembered = () => !!localStorage.getItem(REMEMBER_KEY);
 
 function initAuthClient() {
   const id = getClientId();
@@ -86,6 +91,9 @@ function initAuthClient() {
       if (r.error) return p.rej(new Error(r.error_description || r.error));
       auth.token = r.access_token;
       auth.expires = Date.now() + ((r.expires_in || 3600) - 60) * 1000;
+      auth.needTap = false;
+      try { localStorage.setItem(REMEMBER_KEY, '1'); } catch (_) {}
+      scheduleRefresh();
       p.res();
     },
     error_callback: e => {
@@ -95,19 +103,76 @@ function initAuthClient() {
   });
 }
 
+/* prompt '' = normal (may show a window), 'none' = silent attempt (no window if Google already trusts this device) */
 function requestToken(prompt = '') {
-  return new Promise((res, rej) => {
+  if (auth.promise) return auth.promise;
+  auth.promise = new Promise((res, rej) => {
     try { if (!auth.client) initAuthClient(); } catch (e) { return rej(e); }
     auth.pending = { res, rej };
-    auth.client.requestAccessToken({ prompt });
-  });
+    const opts = { prompt };
+    const hint = localStorage.getItem(EMAIL_KEY); if (hint) opts.hint = hint;
+    if (prompt === 'none') {
+      const mine = auth.pending;
+      setTimeout(() => { if (auth.pending === mine) { auth.pending = null; rej(new Error('Silent sign-in did not finish.')); } }, 12000);
+    }
+    auth.client.requestAccessToken(opts);
+  }).finally(() => { auth.promise = null; });
+  return auth.promise;
+}
+
+async function silentRefresh() {
+  try { await requestToken('none'); return true; } catch (_) { return false; }
+}
+
+function scheduleRefresh() {
+  clearTimeout(auth.refreshTimer);
+  const ms = Math.max(30000, auth.expires - Date.now() - 4 * 60000);
+  auth.refreshTimer = setTimeout(async () => {
+    if (!remembered()) return;
+    if (!(await silentRefresh())) { auth.needTap = true; renderAuth(); armTapReconnect(); }
+  }, ms);
+}
+
+/* if silent sign-in is not allowed, the very next tap anywhere reconnects (a tap is needed to open Google's window) */
+function armTapReconnect() {
+  if (auth.tapArmed) return;
+  auth.tapArmed = true;
+  const fn = e => {
+    document.removeEventListener('click', fn, true);
+    auth.tapArmed = false;
+    if (e.target && e.target.closest && e.target.closest('#topAuth, #btnConnect, #btnDisconnect')) return;
+    if (signedIn() && sync.fileId) {
+      requestToken('').then(() => { auth.needTap = false; renderAuth(); toast('Drive reconnected.'); scheduleSave(); })
+        .catch(err => { toast(err.message, 'error'); armTapReconnect(); });
+    } else connectDrive();
+  };
+  document.addEventListener('click', fn, true);
+}
+
+function autoConnect() {
+  if (!remembered() || !getClientId()) return;
+  let tries = 0;
+  const attempt = async () => {
+    if (!(window.google && google.accounts && google.accounts.oauth2)) { if (++tries < 40) setTimeout(attempt, 500); return; }
+    try {
+      await requestToken('none');
+      sync.user = await driveApi.user().catch(() => null);
+      await loadMemory();
+      renderAuth();
+    } catch (e) {
+      console.warn('Auto sign-in needs a tap:', e.message);
+      auth.needTap = true; renderAuth(); armTapReconnect();
+      toast('Tap anywhere to reconnect Google Drive.', 'warn');
+    }
+  };
+  attempt();
 }
 
 const signedIn = () => !!auth.token;
 
 /* ================= DRIVE API ================= */
 async function driveFetch(url, opts = {}, retry = true) {
-  if (!auth.token || Date.now() > auth.expires) await requestToken('');
+  if (!auth.token || Date.now() > auth.expires) { if (!(await silentRefresh())) await requestToken(''); }
   const res = await fetch(url, { ...opts, headers: { ...(opts.headers || {}), Authorization: 'Bearer ' + auth.token } });
   if (res.status === 401 && retry) { auth.token = null; return driveFetch(url, opts, false); }
   if (!res.ok) {
@@ -236,6 +301,7 @@ async function connectDrive() {
     if (location.protocol === 'file:') throw new Error('Serve this folder over http://localhost (see README). Google sign-in does not work from file://');
     await requestToken('');
     sync.user = await driveApi.user().catch(() => null);
+    try { if (sync.user && sync.user.emailAddress) localStorage.setItem(EMAIL_KEY, sync.user.emailAddress); } catch (_) {}
     await loadMemory();
     renderAuth();
   } catch (e) {
@@ -245,7 +311,9 @@ async function connectDrive() {
 }
 function disconnectDrive() {
   if (auth.token && window.google) { try { google.accounts.oauth2.revoke(auth.token, () => {}); } catch (_) {} }
-  auth.token = null; auth.expires = 0; sync.fileId = null; sync.user = null;
+  auth.token = null; auth.expires = 0; auth.needTap = false; clearTimeout(auth.refreshTimer);
+  try { localStorage.removeItem(REMEMBER_KEY); localStorage.removeItem(EMAIL_KEY); } catch (_) {}
+  sync.fileId = null; sync.user = null;
   data = blankData();
   setSync('offline'); renderAuth(); renderAll();
   toast('Disconnected. Local session cleared.');
@@ -775,6 +843,132 @@ async function setHome(city) {
   return `Okay. Your city is ${p.name}.` + syncNote();
 }
 
+/* ================= AI BRAIN (Phase 3) =================
+   Your API key is kept only in this device's localStorage. It is never written to Google Drive or GitHub. */
+const BRAIN_KEY = 'mars_jarvis_brain';
+const BRAIN_DEFAULTS = { provider: 'gemini', key: '', model: '', share: false };
+const DEFAULT_MODEL = { gemini: 'gemini-flash-latest', anthropic: 'claude-haiku-5-5' };
+const brainCfg = () => { try { return { ...BRAIN_DEFAULTS, ...JSON.parse(localStorage.getItem(BRAIN_KEY) || '{}') }; } catch (_) { return { ...BRAIN_DEFAULTS }; } };
+const brainSave = c => localStorage.setItem(BRAIN_KEY, JSON.stringify(c));
+const brainReady = () => !!brainCfg().key && !ui.noBrain;
+const NO_KEY_MSG = 'I need an AI key first. Open Settings, and add a free Gemini key under AI Brain.';
+
+function brainSystem() {
+  const c = brainCfg();
+  let sys = 'You are Mars Jarvis, a personal voice assistant inspired by Tony Stark\'s Jarvis, running inside the user\'s browser. ' +
+    'Reply in plain spoken English: no markdown, no bullet symbols, no emojis. Keep it under 60 words unless the user asks for more. Be warm, sharp and a little witty. ' +
+    'Current local date and time: ' + new Date().toString() + '. ' +
+    'You can also run app commands. If the user clearly wants an app action, reply with exactly one line starting with CMD: followed by the command, using phrasings like ' +
+    '"set a timer for 10 minutes", "remind me at 5 pm to call mom", "add task buy milk due friday", "add note something", "show tasks", "weather in Manila", "google something", "complete task 2". ' +
+    'Never use CMD for deleting or cancelling anything. For everything else, just answer.';
+  if (c.share) {
+    const tasks = sortedTasks().filter(t => !t.done).slice(0, 10).map(t => `${t.text} (${t.priority}${t.due ? ', due ' + t.due : ''})`);
+    const notes = sortedNotes().slice(0, 10).map(n => n.title);
+    const rems = activeReminders().slice(0, 5).map(r => r.text);
+    sys += ' The user allowed you to see their data. Open tasks: ' + (tasks.join('; ') || 'none') + '. Recent note titles: ' + (notes.join('; ') || 'none') + '. Upcoming reminders: ' + (rems.join('; ') || 'none') + '.';
+  }
+  return sys;
+}
+
+const BAD_CMD = /^(?:delete|remove|clear|erase|wipe|trash|cancel|disconnect|forget|undo)\b/i;
+
+async function brainCall(c, messages) {
+  const model = c.model || DEFAULT_MODEL[c.provider];
+  let res, j;
+  if (c.provider === 'anthropic') {
+    res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': c.key, 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true' },
+      body: JSON.stringify({ model, max_tokens: 500, system: brainSystem(), messages: messages.map(m => ({ role: m.role, content: m.text })) })
+    });
+  } else {
+    res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(c.key)}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: brainSystem() }] },
+        contents: messages.map(m => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.text }] })),
+        generationConfig: { maxOutputTokens: 2048 }
+      })
+    });
+  }
+  if (!res.ok) {
+    const e = new Error('http ' + res.status); e.status = res.status;
+    try { const b = await res.json(); e.detail = (b.error && (b.error.message || b.error.type)) || ''; } catch (_) {}
+    throw e;
+  }
+  j = await res.json();
+  if (c.provider === 'anthropic') return (j.content || []).map(p => p.text || '').join('').trim();
+  const parts = j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts;
+  return (parts || []).map(p => p.text || '').join('').trim();
+}
+
+async function askBrain(text) {
+  const c = brainCfg();
+  if (!c.key) return NO_KEY_MSG;
+  ui.chat.push({ role: 'user', text });
+  while (ui.chat.length > 12) ui.chat.shift();
+  while (ui.chat.length && ui.chat[0].role !== 'user') ui.chat.shift();
+  let out;
+  try { out = await brainCall(c, ui.chat); }
+  catch (e) {
+    ui.chat.pop();
+    console.warn('Brain error', e.status, e.detail);
+    if (e.status === 429) return 'The AI is rate limited right now. Try again in a minute.';
+    if (e.status === 400 || e.status === 401 || e.status === 403) return 'The AI rejected my key or model. Please check AI Brain in Settings.';
+    if (e.status === 404) return 'That AI model name was not found. Clear the model box in Settings to use the default.';
+    return 'I could not reach the AI. Check your connection and try again.';
+  }
+  out = out.replace(/[*_`#>]+/g, '').replace(/\s+\n/g, '\n').trim();
+  if (!out) { ui.chat.pop(); return 'I have nothing to say to that.'; }
+  const cm = out.match(/^CMD:\s*(.+)$/im);
+  if (cm && BAD_CMD.test(cm[1].trim())) { ui.chat.pop(); return 'I will not delete or cancel things on my own. Tell me exactly what to remove, for example, delete note 2.'; }
+  if (cm && !BAD_CMD.test(cm[1].trim())) {
+    ui.noBrain = true;
+    let r;
+    try { r = await processCommand(cm[1].trim()); } catch (_) { r = 'I could not do that.'; }
+    ui.noBrain = false;
+    ui.chat.push({ role: 'assistant', text: 'Done: ' + cm[1].trim() });
+    return r || 'Done.';
+  }
+  ui.chat.push({ role: 'assistant', text: out });
+  ui.lastAnswer = out;
+  return out;
+}
+
+function mountBrainSettings() {
+  const grid = $('#view-settings .two-col'); if (!grid) return;
+  const c = brainCfg();
+  const prov = h('select', {}, h('option', { value: 'gemini' }, 'Google Gemini (free key)'), h('option', { value: 'anthropic' }, 'Anthropic Claude (paid key)'));
+  prov.value = c.provider;
+  const key = h('input', { type: 'password', placeholder: 'Paste your API key', autocomplete: 'off', spellcheck: 'false' }); key.value = c.key;
+  const model = h('input', { placeholder: 'Model (empty = default)', autocomplete: 'off', spellcheck: 'false' }); model.value = c.model;
+  const share = h('input', { type: 'checkbox' }); share.checked = c.share;
+  const status = h('p', { class: 'muted small-t' });
+  const refresh = () => { status.textContent = brainCfg().key ? 'Brain is ON. Ask me anything, or say “ask …”.' : 'Brain is OFF. Without a key I still run all normal commands.'; };
+  const read = () => ({ provider: prov.value, key: key.value.trim(), model: model.value.trim(), share: share.checked });
+  grid.append(h('div', { class: 'glass panel' },
+    h('h3', {}, 'AI Brain'),
+    h('p', { class: 'muted small-t' }, 'Lets Jarvis chat, explain things and understand loose phrasing. Free Gemini keys: aistudio.google.com/apikey. The key stays on this device only (never in Drive or GitHub). What you ask is sent to the provider you pick.'),
+    h('label', {}, 'Provider'), prov,
+    h('label', {}, 'API key'), key,
+    h('label', {}, 'Model'), model,
+    h('label', { class: 'check' }, share, ' Let the brain see my open tasks, note titles and reminders'),
+    h('div', { class: 'btn-row' },
+      h('button', { class: 'btn primary', onclick: () => { brainSave(read()); refresh(); toast('AI Brain saved.'); } }, 'Save'),
+      h('button', { class: 'btn', onclick: async () => {
+        brainSave(read()); refresh(); toast('Testing…');
+        const saved = ui.chat; ui.chat = [];
+        const r = await askBrain('Say hello in five words.'); ui.chat = saved;
+        toast(r, '', 7000);
+      } }, 'Test'),
+      h('button', { class: 'btn danger', onclick: () => { brainSave({ ...read(), key: '' }); key.value = ''; refresh(); toast('Key removed from this device.'); } }, 'Remove key')),
+    status));
+  refresh();
+}
+
+/* explicit "ask the brain" phrasings */
+const BRAIN_TRIGGER = /^(?:ask(?: ai| jarvis)?|ai|chat|explain|tell me about|summari[sz]e|define|describe|compare|brainstorm|translate|draft|write me|write an?|give me (?:an? )?(?:ideas?|tips?|advice|summary|suggestions?)|suggest|recommend|what do you think|should i|help me (?:with|decide|plan|write|understand)|teach me|how does|how do|why does|why do|why is|what should|what would|what if)\b/i;
+
 /* ---------- the parser ---------- */
 const FILLER = /^(?:(?:hey|ok|okay|please|jarvis|yo|hi|so|um|uh|just)[,\s]+|(?:can|could|would|will) you(?: please)?\s+|i want you to\s+|i(?:'d| would) like you to\s+|go ahead and\s+|i(?:'d| would) like to\s+|let's\s+|let me\s+)+/i;
 
@@ -790,6 +984,8 @@ function processCommand(raw) {
     const v = { home: 'home', memory: 'memory', notes: 'memory', task: 'tasks', tasks: 'tasks', voice: 'console', console: 'console', setting: 'settings', settings: 'settings' }[m[1]];
     go(v); return `Opening ${v === 'console' ? 'the voice console' : v}.`;
   }
+
+  for (const f of ext.pre) { const r = f(s, l, raw); if (r !== undefined) return r; }
 
   /* undo */
   if (/^(?:undo|undo that|undo it|bring (?:it|them) back|restore (?:it|them|that))$/.test(l)) {
@@ -839,6 +1035,11 @@ function processCommand(raw) {
   }
 
   /* ---- notes ---- */
+  if (/^(?:save|note|remember|keep)\s+(?:that|this|it)(?:\s+(?:as a note|to my notes|in my notes))?$/.test(l)) {
+    if (!ui.lastAnswer) return 'I have nothing to save yet.';
+    createNote(ui.lastAnswer); return 'Saved that as a note.' + syncNote();
+  }
+  if (/^(?:new chat|forget (?:this|our) (?:chat|conversation)|clear (?:the )?chat|start over)$/.test(l)) { ui.chat = []; return 'Conversation cleared.'; }
   if ((m = s.match(/^(?:read|tell me|show me)\s+(?:me\s+)?(?:the\s+|my\s+)?(first|last|latest|newest|oldest|\d+|one|two|three|four|five)?\s*note(?:\s+(.+))?$/i)) && (m[1] || m[2])) {
     const ref = (m[1] || m[2]).trim();
     const list = sortedNotes();
@@ -1026,6 +1227,12 @@ function processCommand(raw) {
   const calc = evalMath(l);
   if (calc !== null) return `${calc}.`;
 
+  /* ---- AI brain (explicit) ---- */
+  if (BRAIN_TRIGGER.test(l) && !/^(?:write|draft)\s+(?:down|a note|note)/.test(l)) {
+    if (!brainReady()) { if (ui.noBrain) return undefined; return /^(?:ask|ai|chat)\b/.test(l) ? NO_KEY_MSG : googleSearch(s); }
+    return askBrain(s.replace(/^ask(?: ai| jarvis)?[,:\s]+/i, ''));
+  }
+
   /* ---- web ---- */
   if ((m = l.match(/^(?:open|launch|go to|visit|pull up|take me to|start)\s+(?:the\s+)?(?:website\s+)?([a-z0-9 .\/-]+?)(?:\s+(?:app|website|site|page))?$/))) {
     const key = m[1].trim();
@@ -1042,11 +1249,12 @@ function processCommand(raw) {
   if ((m = s.match(/^(?:wikipedia|wiki)\s+(?:for\s+|about\s+)?(.+)$/i))) { openUrl('https://en.wikipedia.org/wiki/Special:Search?search=' + enc(m[1]), 'Wikipedia: ' + m[1]); return `Looking up ${m[1]} on Wikipedia.`; }
   if ((m = s.match(/^(?:google|search google for|search for|search the web for|search the internet for|search online for|web search|search|look up|look)\s+(?:for\s+)?(.+)$/i)) || (m = s.match(/^(?:find me|find)\s+(?:information|info)\s+(?:on|about)\s+(.+)$/i)))
     return googleSearch(m[1]);
-  if (/^(?:who|what|when|where|why|how|which)\b.{4,}/.test(l)) return googleSearch(s);
+  if (/^(?:who|what|when|where|why|how|which)\b.{4,}/.test(l)) return brainReady() ? askBrain(s) : googleSearch(s);
+  for (const f of ext.fallback) { const r = f(s, l, raw); if (r !== undefined) return r; }
 
   /* ---- help ---- */
   if (/^(?:help|what can you do|commands|what do you know)$/.test(l))
-    return 'I can save and read notes, manage tasks with priorities and due dates, set timers and reminders, do quick math, search Google, YouTube and Maps, check the weather, and tell jokes. Try: set a timer for 10 minutes, or remind me at 5 pm to call mom.';
+    return 'I can save and read notes, manage tasks with priorities and due dates, set timers and reminders, do quick math, search Google, YouTube and Maps, check the weather, tell jokes, and chat if you add an AI key in Settings. Try: set a timer for 10 minutes, or remind me at 5 pm to call mom.';
   if ((m = l.match(/^help(?: me)? with\s+(notes?|tasks?|timers?|reminders?|web|search|weather|math|fun)$/))) {
     const h2 = {
       note: 'For notes say: jot down something, read my notes, read note 2, rename note 2 to something, search notes for something, delete note 2.',
@@ -1062,7 +1270,8 @@ function processCommand(raw) {
     return h2[m[1].replace(/s$/, '')] || h2.web;
   }
 
-  return "I didn't recognise that command. Say help, or say google followed by what you want to find.";
+  if (brainReady()) return askBrain(s);
+  return "I didn't recognise that command. Say help, or say google followed by what you want to find. Add an AI key in Settings and I can chat too.";
 }
 
 function runCommand(text, source = 'text') {
@@ -1190,8 +1399,8 @@ function renderMemoryMeta() {
 function renderAuth() {
   const on = signedIn();
   const top = $('#topAuth');
-  top.textContent = on ? ('● ' + (sync.user ? sync.user.emailAddress : 'Drive connected')) : 'Connect Drive';
-  top.classList.toggle('on', on);
+  top.textContent = on ? (auth.needTap ? '⚠ Tap to reconnect' : '● ' + (sync.user ? sync.user.emailAddress : 'Drive connected')) : (remembered() ? 'Reconnect Drive' : 'Connect Drive');
+  top.classList.toggle('on', on && !auth.needTap);
   $('#authInfo').textContent = on
     ? `Connected${sync.user ? ' as ' + sync.user.displayName + ' (' + sync.user.emailAddress + ')' : ''}. Memory file: ${DRIVE_FILE_NAME}`
     : 'Not connected.';
@@ -1295,7 +1504,7 @@ function wire() {
 }
 
 /* ================= BOOT ================= */
-const CHEATS = [["Jarvis, jot down blockchain idea","read my notes","read note 2","rename note 1 to …"],["I need to call mom","add high priority task pay rent due friday"],["complete task 1","clear completed tasks","what is overdue","undo"],["set a timer for 10 minutes","how much time is left","cancel the timer"],["remind me at 5 pm to call mom","remind me in 30 minutes to stretch"],["google best phone 2026","search YouTube for lofi","directions to SM Baguio","open Gmail"],["what is 15 percent of 80","weather in Manila","tell me a joke","help"]];
+const CHEATS = [["Jarvis, jot down blockchain idea", "read my notes", "read note 2", "rename note 1 to …"], ["I need to call mom", "add high priority task pay rent due friday"], ["complete task 1", "clear completed tasks", "what is overdue", "undo"], ["set a timer for 10 minutes", "how much time is left", "cancel the timer"], ["remind me at 5 pm to call mom", "remind me in 30 minutes to stretch"], ["google best phone 2026", "search YouTube for lofi", "directions to SM Baguio", "open Gmail"], ["what is 15 percent of 80", "weather in Manila", "tell me a joke", "help"], ["ask why is the sky blue", "explain blockchain simply", "save that", "new chat"]];
 
 function boot() {
   wire();
@@ -1312,7 +1521,7 @@ function boot() {
   tick(); setInterval(tick, 1000);
 
   /* Phase 2 UI additions: timers panel, new cheat sheet, label */
-  const brand = $('.brand-text span'); if (brand) brand.textContent = 'JARVIS · PHASE 2';
+  const brand = $('.brand-text span'); if (brand) brand.textContent = 'JARVIS · PHASE 3';
   const cheats = $('.cheats');
   if (cheats) {
     const grid = cheats.parentElement.parentElement;
@@ -1323,11 +1532,24 @@ function boot() {
   }
   const hi = $('#homeInput'); if (hi) hi.placeholder = 'Try: "remind me in 30 minutes to stretch"';
   setInterval(() => { checkReminders(); renderReminders(); }, 1000);
+  mountBrainSettings();
+  document.addEventListener('visibilitychange', async () => {
+    if (document.visibilityState === 'visible' && remembered() && !auth.pending && (!auth.token || auth.expires - Date.now() < 5 * 60000)) {
+      if (await silentRefresh()) { auth.needTap = false; renderAuth(); if (!sync.fileId) { try { await loadMemory(); } catch (_) {} } } else if (auth.token || sync.fileId) { auth.needTap = true; renderAuth(); armTapReconnect(); }
+    }
+  });
   setSync('offline'); renderAll(); updateVoiceUI();
   if (data.settings.autoListen && SR) startListening();
+  autoConnect();
 }
 boot();
 
 /* expose memory API for future phases (console / modules) */
 window.MarsJarvis = { get data() { return data; }, saveMemory, loadMemory, addMemory, editMemory, deleteMemory, runCommand, go };
+
+/* plugin system: list extra script files in plugins.json (optional) and they load automatically */
+ext.api = { get data() { return data; }, ui, $, $$, h, toast, speak, touch, uid, nowISO, cap, plural, syncNote, signedIn, go, createNote, createTask, addMemory, editMemory, deleteMemory, runCommand, processCommand, askBrain, brainReady, setMuted };
+fetch('plugins.json', { cache: 'no-store' }).then(r => (r.ok ? r.json() : [])).then(list => {
+  (Array.isArray(list) ? list : []).forEach(f => { if (/^[\w.-]+\.js$/.test(f)) document.head.append(h('script', { src: f })); });
+}).catch(() => {});
 })();
