@@ -1,6 +1,6 @@
 /* Mars Jarvis service worker: lets the app install and open offline.
-   Network-first, so a new version on GitHub shows up as soon as you're online. */
-const CACHE = 'mars-jarvis-v1';
+   Always checks the network for fresh files first, so updates show up right away. */
+const CACHE = 'mars-jarvis-v3';
 const ASSETS = [
   './', './index.html', './style.css', './app.js',
   './manifest.webmanifest', './icon.svg'
@@ -21,9 +21,10 @@ self.addEventListener('activate', e => {
 self.addEventListener('fetch', e => {
   const req = e.request;
   const url = new URL(req.url);
+  // Only handle our own files. Google sign-in and Drive calls go straight to the network.
   if (req.method !== 'GET' || url.origin !== self.location.origin) return;
   e.respondWith(
-    fetch(req)
+    fetch(req, { cache: 'no-cache' })
       .then(res => {
         const copy = res.clone();
         caches.open(CACHE).then(c => c.put(req, copy));
