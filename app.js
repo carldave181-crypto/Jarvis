@@ -916,7 +916,7 @@ async function askBrain(text) {
     if (e.status === 429) return 'The AI is rate limited right now. Try again in a minute.';
     if (e.status === 400 || e.status === 401 || e.status === 403) return 'The AI rejected my key or model. Please check AI Brain in Settings.';
     if (e.status === 404) return 'That AI model name was not found. Clear the model box in Settings to use the default.';
-    return 'I could not reach the AI. Check your connection and try again.';
+    return 'I could not reach the AI (' + (e.status || e.message || 'no response') + '). ' + String(e.detail || '').slice(0, 160);;
   }
   out = out.replace(/[*_`#>]+/g, '').replace(/\s+\n/g, '\n').trim();
   if (!out) { ui.chat.pop(); return 'I have nothing to say to that.'; }
