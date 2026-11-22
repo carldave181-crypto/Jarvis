@@ -1528,7 +1528,7 @@ function boot() {
     const panel = h('div', { class: 'glass panel' }, h('h3', {}, 'Timers & reminders'), h('ul', { id: 'remList', class: 'list' }));
     grid.insertBefore(panel, cheats.parentElement);
     cheats.innerHTML = '';
-        CHEATS.forEach(line => cheats.append(h('li', {}, line.map((c, i) => [i ? ' · ' : '', h('code', {}, c)]).flat())));
+        CHEATS.forEach(line => cheats.append(h('li', {}, line.map((c, i) => [i ? ' · ' : '', h('code', {}, c)]).flat())))};
   const hi = $('#homeInput'); if (hi) hi.placeholder = 'Try: "remind me in 30 minutes to stretch"';
   setInterval(() => { checkReminders(); renderReminders(); }, 1000);
   mountBrainSettings();
